@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
 #include <memory>
@@ -21,6 +22,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include "repack.h"
 
@@ -29,6 +34,45 @@
 #endif
 
 #define UNUSED GGML_UNUSED
+
+static int ggml_repack_trace_numa_node() {
+#if defined(__linux__) && defined(SYS_getcpu)
+    unsigned cpu = 0;
+    unsigned node = 0;
+    if (syscall(SYS_getcpu, &cpu, &node, NULL) == 0) {
+        return (int) node;
+    }
+#endif
+    return -1;
+}
+
+static void ggml_repack_trace_mmid(const ggml_tensor * dst, const ggml_tensor * src0, const int64_t * matrix_row_counts, int n_as, int n_ids, int64_t ids_cols, bool expert_parallel) {
+    const char * path = std::getenv("GGML_CPU_MMID_TRACE");
+    if (path == nullptr || path[0] == '\0' || std::strcmp(path, "0") == 0) {
+        return;
+    }
+    FILE * f = (std::strcmp(path, "1") == 0 || std::strcmp(path, "stderr") == 0) ? stderr : std::fopen(path, "a");
+    if (f == nullptr) {
+        return;
+    }
+    std::fprintf(f,
+            "cpu-mmid-trace rank=%d node=%s src0=%s type=%s n_expert=%d n_ids=%d ids_cols=%lld expert_parallel=%d dst_ne=[%lld,%lld,%lld,%lld] src0_ne=[%lld,%lld,%lld,%lld] counts=",
+            ggml_repack_trace_numa_node(), dst->name, src0->name, ggml_type_name(src0->type), n_as, n_ids, (long long) ids_cols,
+            expert_parallel ? 1 : 0,
+            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+            (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3]);
+    bool first = true;
+    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        if (matrix_row_counts[cur_a] != 0) {
+            std::fprintf(f, "%s%d:%lld", first ? "" : ",", cur_a, (long long) matrix_row_counts[cur_a]);
+            first = false;
+        }
+    }
+    std::fprintf(f, "\n");
+    if (f != stderr) {
+        std::fclose(f);
+    }
+}
 
 static inline int nearest_int(float fval) {
     assert(fabsf(fval) <= 4194303.f);
@@ -6228,7 +6272,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t i1 = i11;
         const int64_t i2 = i12;
 
-        const char * src0_ptr = (const char *) src0->data + i02 * nb02;
+        const char * src0_ptr = (const char *) ggml_numa_mirror_remap(src0->data) + i02 * nb02;
         const char * src1_ptr = (const char *) params->wdata + (i11 + i12 * ne11) * src1_col_stride;
         char *       dst_ptr  = ((char *) dst->data + (i1 * nb1 + i2 * nb2));
 
@@ -6257,6 +6301,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     }
 
     void forward_mul_mat(ggml_compute_params * params, ggml_tensor * op) {
+        const bool focus = ggml_cpu_focus_mat_enabled(params, op);
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
         ggml_tensor *       dst  = op;
@@ -6365,7 +6410,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             ggml_threadpool_chunk_set(params->threadpool, nth);
         }
 
+        if (focus) ggml_cpu_focus_mat_phase(params, 0, 0, nullptr);
         ggml_barrier(params->threadpool);
+        if (focus) ggml_cpu_focus_mat_phase(params, 1, 0, nullptr);
 
         // The first chunk comes from our thread_id, the rest will get auto-assigned.
         int current_chunk = ith;
@@ -6394,6 +6441,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             forward_mul_mat_one_chunk(params, dst, src0_start, src0_end, src1_start, src1_end);
+            if (focus) ggml_cpu_focus_mat_phase(params, 2, (src0_end - src0_start) * (src1_end - src1_start), ggml_numa_mirror_remap(src0->data));
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
@@ -6514,6 +6562,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
             mmid_flags[0] = expert_parallel ? 1 : 0;
 
+            ggml_repack_trace_mmid(dst, src0, matrix_row_counts, n_as, n_ids, ids->ne[1], expert_parallel);
+
             int64_t off = 0;
             for (int cur_a = 0; cur_a < n_as; ++cur_a) {
                 matrix_row_offs[cur_a] = off;
@@ -6618,7 +6668,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         auto compute_expert = [&](int cur_a, int64_t r0, int64_t r1, int64_t c0, int64_t c1) {
             const int64_t cne1 = matrix_row_counts[cur_a];
 
-            const auto * src0_cur  = (const char *) src0->data + cur_a*nb02;
+            const auto * src0_cur  = (const char *) ggml_numa_mirror_remap(src0->data) + cur_a*nb02;
             const char * src1_rows = wdata + matrix_row_offs[cur_a] * nbw1;
 
             const int64_t ncols = c1 - c0;

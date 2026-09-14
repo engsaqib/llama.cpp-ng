@@ -2801,6 +2801,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
             else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else if (value == "mirror") { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
             else if (value == "split") { params.numa = GGML_NUMA_STRATEGY_SPLIT; }
             else { throw std::invalid_argument("invalid value"); }
         }

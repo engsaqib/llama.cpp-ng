@@ -211,6 +211,10 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Submit a graph asynchronously without cloning it. Only callers that own a stable graph
+    // for the full async execution lifetime may use this (e.g. cached meta-backend subgraphs).
+    typedef enum ggml_status (*ggml_backend_graph_compute_borrowed_t)(ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
@@ -368,6 +372,7 @@ extern "C" {
     //
 
 #define GGML_BACKEND_META_MAX_DEVICES 16
+#define GGML_BACKEND_META_SPLIT_SEGMENT_REPLICATED (1u << 31)
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:

@@ -104,9 +104,19 @@ const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {
     return ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer));
 }
 
+static ggml_sched_buffer_free_notify_t g_sched_buffer_free_notify = NULL;
+
+void ggml_sched_set_buffer_free_notify(ggml_sched_buffer_free_notify_t fn) {
+    g_sched_buffer_free_notify = fn;
+}
+
 void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
     if (buffer == NULL) {
         return;
+    }
+
+    if (g_sched_buffer_free_notify != NULL) {
+        g_sched_buffer_free_notify(buffer);
     }
 
     if (buffer->iface.free_buffer != NULL) {

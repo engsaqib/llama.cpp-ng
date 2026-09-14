@@ -29,6 +29,8 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -424,6 +426,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
     };
 
+    auto get_layer_index = [&]() -> int {
+        if (tensor_name.substr(0, 4) == "blk.") {
+            const size_t length_prefix = tensor_name.find('.', 4);
+            GGML_ASSERT(length_prefix != std::string::npos);
+            return (int) std::stoull(tensor_name.substr(4, length_prefix));
+        }
+        if (tensor_name.substr(0, 6) == "cache_") {
+            const size_t layer_index_start = tensor_name.find("_l", 6);
+            GGML_ASSERT(layer_index_start != std::string::npos);
+            return (int) std::stoull(tensor_name.substr(layer_index_start + 2));
+        }
+        return -1;
+    };
+
+    auto use_replicated_gqa_split = [&]() -> bool {
+        const int il = get_layer_index();
+        return std::getenv("GGML_NUMA_TP_REPLICATE_GQA") != nullptr &&
+            ud->model->arch == LLM_ARCH_QWEN4EXP && ud->n_devices == 4 && il >= 0 && !hparams.is_recr(il);
+    };
+
     auto get_tensor_config_impl = [&](
                 const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
         // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
@@ -495,6 +517,28 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
             }
+        }
+
+        // NUMA-TP experiment: optionally mirror output projections that otherwise
+        // create tiny 10 KiB allreduce boundaries at decode. This deliberately
+        // trades extra local weight reads for fewer cross-node synchronization
+        // points, and is off unless GGML_NUMA_TP_MIRROR_OUT_PROJ is set.
+        if (std::getenv("GGML_NUMA_TP_MIRROR_OUT_PROJ") != nullptr &&
+                (std::regex_match(tensor_name, pattern_attn_out_weight) ||
+                 std::regex_match(tensor_name, pattern_ssm_out_weight))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
+        // NUMA-TP experiment: mirror routed MoE expert tensors. This tests the
+        // opposite trade from tensor sharding: remove ffn_moe_out partial-sum
+        // boundaries at the cost of redundant per-node expert compute/reads.
+        if (std::getenv("GGML_NUMA_TP_MIRROR_MOE") != nullptr &&
+                (std::regex_match(tensor_name, pattern_ffn_up_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_down_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_down_exps_bias))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
         // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
@@ -736,12 +780,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                         ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                    if (use_replicated_gqa_split()) {
+                        return {std::lcm(n_embd_q, blck_size_perf)};
+                    }
                     return {std::lcm(2*n_embd_q, blck_size_perf)};
                 }
                 return {granularity_q};
             }
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
+                if (use_replicated_gqa_split()) {
+                    GGML_ASSERT(hparams.n_head(il) % ud->n_devices == 0);
+                    return {int64_t(hparams.n_head(il) / ud->n_devices) * hparams.n_embd_head_k(il)};
+                }
                 return {granularity_q};
             }
             if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
@@ -773,7 +824,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            int64_t blck_size_perf = std::lcm(blck_size, 128);
+            if (const char * env = std::getenv("GGML_NUMA_TP_FFN_GRANULARITY")) {
+                const int64_t requested = std::atoll(env);
+                if (requested > 0 && requested % blck_size == 0) {
+                    blck_size_perf = requested;
+                }
+            }
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
         }
@@ -787,7 +844,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
-    if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+    if (use_replicated_gqa_split() &&
+            (std::regex_match(tensor_name, pattern_kv_weight) ||
+             std::regex_match(tensor_name, pattern_kv_bias) ||
+             std::regex_match(tensor_name, pattern_kv_cache))) {
+        GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
+        GGML_ASSERT(ud->n_devices == 4);
+        const int64_t half = tensor->ne[split_state.axis] / 2;
+        GGML_ASSERT(2*half == tensor->ne[split_state.axis]);
+        memset(split_state.ne, 0, sizeof(split_state.ne));
+        split_state.n_segments = 2;
+        split_state.nr[0] = 1;
+        split_state.nr[1] = 1;
+        split_state.ne[0*ud->n_devices + 0] = half;
+        split_state.ne[0*ud->n_devices + 1] = half;
+        split_state.ne[1*ud->n_devices + 2] = half;
+        split_state.ne[1*ud->n_devices + 3] = half;
+    } else if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
         std::vector<float> tensor_split_scan;
@@ -834,6 +907,34 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
     }
+
+    // Experimental NUMA-TP audit hook.  When enabled, dump the tensor split
+    // decision made for each tensor so the CPU-NUMA tensor-parallel path can be
+    // debugged without stepping through the loader.  Set
+    // GGML_NUMA_TP_SPLIT_DUMP=1 for stderr, or to a path to append there.
+    if (const char * dump_path = std::getenv("GGML_NUMA_TP_SPLIT_DUMP")) {
+        int dump_layer = -1;
+        if (const char * dump_layer_env = std::getenv("GGML_NUMA_TP_SPLIT_DUMP_LAYER")) {
+            dump_layer = std::atoi(dump_layer_env);
+        }
+        if (dump_layer < 0 || (tensor_name.rfind("blk.", 0) == 0 && (int) tc.il == dump_layer)) {
+            FILE * dump = (std::strcmp(dump_path, "1") == 0 || std::strcmp(dump_path, "stderr") == 0) ? stderr : std::fopen(dump_path, "a");
+            if (dump != nullptr) {
+                std::fprintf(dump, "numa-tp-split tensor=%s axis=%d segments=%u rotation=%zu", tensor_name.c_str(), (int) split_state.axis, split_state.n_segments, tc.rotation);
+                for (size_t is = 0; is < split_state.n_segments; ++is) {
+                    std::fprintf(dump, " seg%zu_nr=%u", is, split_state.nr[is]);
+                    for (size_t j = 0; j < ud->n_devices; ++j) {
+                        std::fprintf(dump, " d%zu=%lld", j, (long long) split_state.ne[is*ud->n_devices + j]);
+                    }
+                }
+                std::fprintf(dump, "\n");
+                if (dump != stderr) {
+                    std::fclose(dump);
+                }
+            }
+        }
+    }
+
     return split_state;
     GGML_UNUSED(userdata);
 }

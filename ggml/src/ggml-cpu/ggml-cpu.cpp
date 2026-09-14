@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-cpu-impl.h"
 #include "numa.h"
 #include "repack.h"
 #include "traits.h"
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cctype>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -38,6 +40,9 @@
 #    include <windows.h>
 #else
 #    include <unistd.h>
+#    if defined(__linux__)
+#        include <sys/syscall.h>
+#    endif
 #endif
 
 #if defined(__APPLE__)
@@ -93,6 +98,10 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
     }
     // per node repack buffer types are not in the global list, match them by kind
     return ggml_backend_cpu_buft_is_repack(buft);
+}
+
+extern "C" bool ggml_backend_cpu_buft_is_mirrorable(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && (ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft));
 }
 
 // CPU backend - backend (stream)
@@ -181,7 +190,9 @@ struct ggml_backend_cpu_graph_copy {
 struct ggml_backend_cpu_async_op {
     enum { COMPUTE } kind = COMPUTE;
 
-    std::unique_ptr<ggml_backend_cpu_graph_copy> graph; // COMPUTE
+    std::unique_ptr<ggml_backend_cpu_graph_copy> graph; // COMPUTE when self-owned
+    struct ggml_cgraph * borrowed_graph = nullptr;       // COMPUTE when caller guarantees lifetime
+    int64_t focus_dispatch = 0;
 };
 
 // a NUMA node backend computes on its own dispatcher thread. the dispatcher is pinned to the node, so the
@@ -191,6 +202,12 @@ struct ggml_backend_cpu_async_op {
 //
 // as with every asynchronous backend, freeing a buffer an in-flight graph still uses is the caller's
 // responsibility (synchronize first); llama pre-reserves its compute buffers, so this does not come up there
+struct ggml_cpu_focus_graph {
+    uint64_t sequence, uid;
+    int64_t dispatch, start, end, arrival;
+    char name[GGML_MAX_NAME];
+};
+
 struct ggml_backend_cpu_async {
     std::thread             thread;
     std::mutex              mutex;
@@ -201,6 +218,20 @@ struct ggml_backend_cpu_async {
     enum ggml_status        status  = GGML_STATUS_SUCCESS; // of the last failed graph, kept until a caller sees it
     bool                    status_logged = false; // a pending failure was already reported by synchronize
     bool                    stop    = false;
+
+    // Aggregate profiling for async CPU subgraph execution. Env: GGML_CPU_ASYNC_PROFILE=/path or stderr.
+    uint64_t ops                    = 0;
+    int64_t  compute_us             = 0;
+    int64_t  max_graph_us           = 0;
+    int64_t  last_graph_start_us    = 0;
+    int64_t  last_graph_end_us      = 0;
+    int64_t  last_graph_duration_us = 0;
+    uint64_t borrowed_ops           = 0;
+
+    std::vector<ggml_cpu_focus_graph> focus_graphs;
+    size_t focus_count = 0;
+    size_t focus_dropped = 0;
+    int focus_rank = -1;
 
     bool idle() const {
         return queue.empty() && !running;
@@ -246,6 +277,35 @@ static void ggml_backend_cpu_free(ggml_backend_t backend) {
             cpu_ctx->async->cv.notify_all();
         }
         cpu_ctx->async->thread.join(); // drains the queued work first
+        if (const char * path = std::getenv("GGML_CPU_ASYNC_PROFILE")) {
+            FILE * f = (strcmp(path, "1") == 0 || strcmp(path, "stderr") == 0) ? stderr : fopen(path, "a");
+            if (f != nullptr) {
+                std::fprintf(f,
+                        "cpu-async-profile device=%s ops=%llu borrowed_ops=%llu compute_us=%lld max_graph_us=%lld\n",
+                        backend->device ? ggml_backend_dev_name(backend->device) : "CPU",
+                        (unsigned long long) cpu_ctx->async->ops,
+                        (unsigned long long) cpu_ctx->async->borrowed_ops,
+                        (long long) cpu_ctx->async->compute_us,
+                        (long long) cpu_ctx->async->max_graph_us);
+                if (f != stderr) {
+                    std::fclose(f);
+                }
+            }
+        }
+        auto * a = cpu_ctx->async;
+        if (!a->focus_graphs.empty()) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.graphs.%d.%p.%lld.tsv", std::getenv("GGML_CPU_FOCUS"), a->focus_rank, (void *) a, (long long) (a->focus_count ? a->focus_graphs[0].start : ggml_time_us()));
+            if (FILE * f = fopen(path, "w")) {
+                fprintf(f, "# count=%zu dropped=%zu\nseq\tuid\tdispatch\tstart\tend\tarrival\tname\n", a->focus_count, a->focus_dropped);
+                for (size_t i = 0; i < a->focus_count; ++i) {
+                    const auto & r = a->focus_graphs[i];
+                    fprintf(f, "%llu\t%llu\t%lld\t%lld\t%lld\t%lld\t%s\n", (unsigned long long) r.sequence, (unsigned long long) r.uid,
+                        (long long) r.dispatch, (long long) r.start, (long long) r.end, (long long) r.arrival, r.name);
+                }
+                fclose(f);
+            }
+        }
         delete cpu_ctx->async;
     }
     if (cpu_ctx->own_threadpool != NULL) {
@@ -302,6 +362,9 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute_impl(struct ggml_backend_cpu_context * cpu_ctx, struct ggml_cgraph * cgraph) {
+    // no-op unless --numa mirror is set; first call builds the weight replicas
+    ggml_numa_mirror_scan_graph(cgraph);
+
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, ggml_backend_cpu_threadpool(cpu_ctx));
 
     if (cpu_ctx->work_size < cplan.work_size) {
@@ -327,6 +390,15 @@ static void ggml_backend_cpu_async_loop(struct ggml_backend_cpu_context * cpu_ct
     ggml::cpu::numa::bind_current_thread(cpus);
 
     struct ggml_backend_cpu_async * a = cpu_ctx->async;
+    const char * focus = std::getenv("GGML_CPU_FOCUS");
+    if (focus && focus[0]) {
+        a->focus_graphs.resize(65536);
+        // Device CPUs are enumerated by node; query once on this pinned dispatcher.
+#if defined(__linux__) && defined(SYS_getcpu)
+        unsigned cpu, node;
+        if (syscall(SYS_getcpu, &cpu, &node, nullptr) == 0) a->focus_rank = node;
+#endif
+    }
     for (;;) {
         struct ggml_backend_cpu_async_op op;
         {
@@ -341,20 +413,46 @@ static void ggml_backend_cpu_async_loop(struct ggml_backend_cpu_context * cpu_ct
             a->running = true;
         }
 
+        const bool borrowed = op.borrowed_graph != nullptr;
+        if (!a->focus_graphs.empty()) ggml_cpu_focus_set(ggml_backend_cpu_threadpool(cpu_ctx), a->ops + 1, a->focus_rank);
+        const int64_t t_compute = ggml_time_us();
         enum ggml_status status = GGML_STATUS_SUCCESS;
         switch (op.kind) {
             case ggml_backend_cpu_async_op::COMPUTE:
-                status = ggml_backend_cpu_graph_compute_impl(cpu_ctx, &op.graph->graph);
+                status = ggml_backend_cpu_graph_compute_impl(cpu_ctx, borrowed ? op.borrowed_graph : &op.graph->graph);
                 break;
         }
+        const int64_t graph_us = ggml_time_us() - t_compute;
 
         {
             std::lock_guard<std::mutex> lock(a->mutex);
+            a->ops++;
+            a->compute_us += graph_us;
+            a->max_graph_us = std::max(a->max_graph_us, graph_us);
+            a->last_graph_start_us = t_compute;
+            a->last_graph_end_us = t_compute + graph_us;
+            a->last_graph_duration_us = graph_us;
+            if (borrowed) {
+                a->borrowed_ops++;
+            }
             if (status != GGML_STATUS_SUCCESS) {
                 GGML_LOG_ERROR("%s: graph computation failed with status %d\n", __func__, status);
             }
             if (a->status == GGML_STATUS_SUCCESS) {
                 a->status = status; // kept until a caller sees it
+            }
+            if (!a->focus_graphs.empty()) {
+                if (a->focus_count < a->focus_graphs.size()) {
+                    auto & r = a->focus_graphs[a->focus_count++];
+                    const auto * graph = borrowed ? op.borrowed_graph : &op.graph->graph;
+                    r.sequence = a->ops;
+                    r.uid = graph->uid;
+                    r.dispatch = op.focus_dispatch;
+                    r.start = t_compute;
+                    r.end = t_compute + graph_us;
+                    r.arrival = ggml_time_us();
+                    snprintf(r.name, sizeof(r.name), "%s", graph->n_nodes ? graph->nodes[graph->n_nodes - 1]->name : "");
+                } else a->focus_dropped++;
             }
             a->running = false;
             a->cv.notify_all();
@@ -381,7 +479,7 @@ static void ggml_backend_cpu_async_wait_idle(struct ggml_backend_cpu_context * c
     a->cv.wait(lock, [a] { return a->idle(); });
 }
 
-static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_cpu_graph_compute_queue(ggml_backend_t backend, struct ggml_cgraph * cgraph, bool borrowed) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
     struct ggml_backend_cpu_async * a = cpu_ctx->async;
@@ -391,8 +489,13 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
 
     struct ggml_backend_cpu_async_op op;
     op.kind  = ggml_backend_cpu_async_op::COMPUTE;
-    op.graph = std::make_unique<ggml_backend_cpu_graph_copy>();
-    op.graph->take(cgraph);
+
+    if (borrowed) {
+        op.borrowed_graph = cgraph;
+    } else {
+        op.graph = std::make_unique<ggml_backend_cpu_graph_copy>();
+        op.graph->take(cgraph);
+    }
 
     std::lock_guard<std::mutex> lock(a->mutex);
 
@@ -403,10 +506,22 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     a->status        = GGML_STATUS_SUCCESS;
     a->status_logged = false;
 
+    static const bool focus = [] { const char * v = std::getenv("GGML_CPU_FOCUS"); return v && v[0]; }();
+    if (focus) op.focus_dispatch = ggml_time_us();
     a->queue.push_back(std::move(op));
     a->cv.notify_all();
 
     return status;
+}
+
+static enum ggml_status ggml_backend_cpu_graph_compute_borrowed(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    return ggml_backend_cpu_graph_compute_queue(backend, cgraph, true);
+}
+
+static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    // Legacy experimental escape hatch. Prefer the explicit proc-address entry
+    // point above, used by the Meta backend for cached stable subgraphs.
+    return ggml_backend_cpu_graph_compute_queue(backend, cgraph, std::getenv("GGML_CPU_ASYNC_BORROW_GRAPH") != nullptr);
 }
 
 static void ggml_backend_cpu_synchronize(ggml_backend_t backend) {
@@ -455,6 +570,7 @@ static ggml_guid_t ggml_backend_cpu_guid(void) {
 ggml_backend_t ggml_backend_cpu_init(void) {
     // initialize CPU backend now to avoid slowing the first graph computation
     ggml_cpu_init();
+    ggml_sched_set_buffer_free_notify(ggml_numa_mirror_buffer_freed);
 
     struct ggml_backend_cpu_context * ctx = new ggml_backend_cpu_context;
     if (ctx == NULL) {
@@ -853,7 +969,14 @@ static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu
     // letting the scheduler balance within the node is slightly better
     tpp.strict_cpu = n_threads <= ctx->n_cores;
 
+#if defined(__linux__) && !defined(GGML_USE_OPENMP)
+    const char * poll_inactive = getenv("GGML_CPU_NUMA_POLL_INACTIVE");
+    const bool enable = poll_inactive && strcmp(poll_inactive, "1") == 0 && ctx->numa_node >= 0 &&
+        tpp.poll > 0 && n_threads > 1 && tpp.strict_cpu && n_threads <= ctx->n_cores && n_threads <= n_masked;
+    return ggml_threadpool_new_numa(&tpp, enable);
+#else
     return ggml_threadpool_new(&tpp);
+#endif
 }
 
 static ggml_threadpool_t ggml_backend_cpu_device_threadpool(ggml_backend_dev_t dev, int n_threads) {
@@ -1289,12 +1412,126 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 // few tens of KiB per boundary, where the fallback's fixed dispatch cost dominates the token time.
 
 // prompt-sized boundary tensors are reduced faster by the fallback, whose ADDs run on the node
-// thread pools; a single thread only wins while the data is small
-static const size_t GGML_CPU_COMM_MAX_BYTES = 1024*1024;
+// thread pools; a single thread only wins while the data is small.  Allow the
+// NUMA-TP experiment to sweep this without rebuilds.
+static size_t ggml_backend_cpu_comm_max_bytes(void) {
+    const char * env = std::getenv("GGML_CPU_COMM_MAX_BYTES");
+    if (env != nullptr) {
+        return strtoull(env, nullptr, 10);
+    }
+    return 1024*1024;
+}
 
 struct ggml_backend_cpu_comm {
     std::vector<ggml_backend_t> backends;
+
+    // Experimental persistent helper threads for tiny CPU-NUMA allreduces.
+    // Env: GGML_CPU_COMM_PARALLEL=1 enables n_backends helpers, or set an
+    // integer worker count. Off by default because tiny reductions can be
+    // latency-sensitive and the condition-variable overhead may lose.
+    std::vector<std::thread> workers;
+    std::mutex              mutex;
+    std::condition_variable cv_start;
+    std::condition_variable cv_done;
+    bool                    stop       = false;
+    uint64_t                seq        = 0;
+    size_t                  done       = 0;
+    struct ggml_tensor **   tensors    = nullptr;
+    int64_t                 ne         = 0;
+
+    // Aggregate profiling for NUMA-TP collectives. Env: GGML_CPU_COMM_PROFILE=/path or stderr.
+    struct focus_ready_record { uint64_t call; int64_t ready; char name[GGML_MAX_NAME]; };
+    std::vector<focus_ready_record> focus_ready;
+    size_t focus_count = 0;
+    size_t focus_dropped = 0;
+    uint64_t calls                  = 0;
+    uint64_t bytes                  = 0;
+    int64_t  sync_us                = 0;
+    int64_t  reduce_us              = 0;
+    int64_t  bcast_us               = 0;
+    int64_t  arrival_skew_us        = 0;
+    int64_t  post_arrival_us        = 0;
+    int64_t  max_arrival_skew_us    = 0;
+    int64_t  max_post_arrival_us    = 0;
 };
+
+static void ggml_backend_cpu_comm_dump_tensor(const char * phase, const struct ggml_tensor * tensor, size_t rank) {
+    const char * dir = std::getenv("GGML_CPU_COMM_DUMP");
+    if (dir == nullptr || tensor == nullptr || tensor->data == nullptr) {
+        return;
+    }
+    const char * filter = std::getenv("GGML_CPU_COMM_DUMP_FILTER");
+    if (filter != nullptr && strstr(tensor->name, filter) == nullptr) {
+        return;
+    }
+    char name[256];
+    size_t n = 0;
+    for (; tensor->name[n] != '\0' && n + 1 < sizeof(name); ++n) {
+        const char c = tensor->name[n];
+        name[n] = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') ? c : '_';
+    }
+    name[n] = '\0';
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/%s.%s.rank%zu.bin", dir, name, phase, rank);
+    if (FILE * f = std::fopen(path, "wb")) {
+        std::fwrite(tensor->data, 1, ggml_nbytes(tensor), f);
+        std::fclose(f);
+    }
+    std::snprintf(path, sizeof(path), "%s/manifest.tsv", dir);
+    if (FILE * f = std::fopen(path, "a")) {
+        std::fprintf(f, "%s\t%s\t%zu\t%s\t%zu\t%lld,%lld,%lld,%lld\tcompute=%d\n",
+                phase, tensor->name, rank, ggml_type_name(tensor->type), ggml_nbytes(tensor),
+                (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+                (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0);
+        std::fclose(f);
+    }
+}
+
+static void ggml_backend_cpu_comm_worker(struct ggml_backend_cpu_comm * comm, size_t ith) {
+    uint64_t seen = 0;
+    for (;;) {
+        struct ggml_tensor ** tensors;
+        int64_t ne;
+        size_t n_workers;
+        size_t n_backends;
+        {
+            std::unique_lock<std::mutex> lock(comm->mutex);
+            comm->cv_start.wait(lock, [&] { return comm->stop || comm->seq != seen; });
+            if (comm->stop) {
+                return;
+            }
+            seen       = comm->seq;
+            tensors    = comm->tensors;
+            ne         = comm->ne;
+            n_workers  = comm->workers.size();
+            n_backends = comm->backends.size();
+        }
+
+        const int64_t i0 = (int64_t) ith * ne / (int64_t) n_workers;
+        const int64_t i1 = (int64_t) (ith + 1) * ne / (int64_t) n_workers;
+        float * acc = (float *) tensors[0]->data;
+        for (int64_t i = i0; i < i1; i++) {
+            float v = 0.0f;
+            for (size_t j = 0; j < n_backends; j++) {
+                if (tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                    v += ((float *) tensors[j]->data)[i];
+                }
+            }
+            acc[i] = v;
+        }
+        for (size_t j = 1; j < n_backends; j++) {
+            memcpy((float *) tensors[j]->data + i0, acc + i0, (i1 - i0) * sizeof(float));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(comm->mutex);
+            comm->done++;
+            if (comm->done == comm->workers.size()) {
+                comm->cv_done.notify_one();
+            }
+        }
+    }
+}
 
 static void * ggml_backend_cpu_comm_init(ggml_backend_t * backends, size_t n_backends) {
     if (n_backends < 2) {
@@ -1309,6 +1546,22 @@ static void * ggml_backend_cpu_comm_init(ggml_backend_t * backends, size_t n_bac
 
     struct ggml_backend_cpu_comm * comm = new ggml_backend_cpu_comm;
     comm->backends.assign(backends, backends + n_backends);
+    const char * focus = std::getenv("GGML_CPU_FOCUS");
+    if (focus && focus[0]) comm->focus_ready.resize(65536);
+
+    if (const char * env = std::getenv("GGML_CPU_COMM_PARALLEL")) {
+        size_t n_workers = strtoull(env, nullptr, 10);
+        if (n_workers == 0 && env[0] != '0') {
+            n_workers = n_backends;
+        }
+        if (n_workers > 0) {
+            n_workers = std::min<size_t>(n_workers, n_backends);
+            comm->workers.reserve(n_workers);
+            for (size_t i = 0; i < n_workers; i++) {
+                comm->workers.emplace_back(ggml_backend_cpu_comm_worker, comm, i);
+            }
+        }
+    }
     return comm;
 }
 
@@ -1317,7 +1570,7 @@ static bool ggml_backend_cpu_comm_allreduce_tensor(void * comm_ctx, struct ggml_
     const size_t n_backends = comm->backends.size();
 
     const size_t nbytes = ggml_nbytes(tensors[0]);
-    if (nbytes > GGML_CPU_COMM_MAX_BYTES) {
+    if (nbytes > ggml_backend_cpu_comm_max_bytes()) {
         return false;
     }
     for (size_t j = 0; j < n_backends; j++) {
@@ -1327,9 +1580,41 @@ static bool ggml_backend_cpu_comm_allreduce_tensor(void * comm_ctx, struct ggml_
     }
 
     // the partials were dispatched to the backends just before this call
+    const int64_t t_sync = ggml_time_us();
     for (size_t j = 0; j < n_backends; j++) {
         ggml_backend_synchronize(comm->backends[j]);
     }
+    const int64_t sync_us = ggml_time_us() - t_sync;
+
+    std::vector<int64_t> rank_compute_us(n_backends, 0);
+    std::vector<int64_t> rank_start_us(n_backends, 0);
+    std::vector<int64_t> rank_end_us(n_backends, 0);
+    std::vector<int>     rank_compute_flags(n_backends, 0);
+    int64_t min_arrival_us = 0;
+    int64_t max_arrival_us = 0;
+    for (size_t j = 0; j < n_backends; j++) {
+        struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *) comm->backends[j]->context;
+        if (cpu_ctx->async == nullptr) {
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(cpu_ctx->async->mutex);
+        rank_compute_us[j] = cpu_ctx->async->last_graph_duration_us;
+        rank_start_us[j] = cpu_ctx->async->last_graph_start_us;
+        rank_end_us[j] = cpu_ctx->async->last_graph_end_us;
+        rank_compute_flags[j] = (tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0;
+        const int64_t end_us = cpu_ctx->async->last_graph_end_us;
+        if (end_us > 0) {
+            min_arrival_us = min_arrival_us == 0 ? end_us : std::min(min_arrival_us, end_us);
+            max_arrival_us = std::max(max_arrival_us, end_us);
+        }
+    }
+    const int64_t arrival_skew_us = max_arrival_us > min_arrival_us ? max_arrival_us - min_arrival_us : 0;
+
+    comm->calls++;
+    comm->bytes += nbytes;
+    comm->sync_us += sync_us;
+    comm->arrival_skew_us += arrival_skew_us;
+    comm->max_arrival_skew_us = std::max(comm->max_arrival_skew_us, arrival_skew_us);
 
     // if a backend failed, its partial is garbage and the computation is already lost; skip the
     // reduction and let the failure surface from that backend's next graph_compute call
@@ -1342,6 +1627,63 @@ static bool ggml_backend_cpu_comm_allreduce_tensor(void * comm_ctx, struct ggml_
     // sum the partials of the backends that computed one (a backend whose slice of the producing
     // matmul was empty leaves garbage in its tensor), then give every backend the sum
     const int64_t ne  = ggml_nelements(tensors[0]);
+
+    if (!comm->workers.empty()) {
+        const int64_t t_reduce = ggml_time_us();
+        {
+            std::lock_guard<std::mutex> lock(comm->mutex);
+            comm->tensors = tensors;
+            comm->ne      = ne;
+            comm->done    = 0;
+            comm->seq++;
+        }
+        comm->cv_start.notify_all();
+        {
+            std::unique_lock<std::mutex> lock(comm->mutex);
+            comm->cv_done.wait(lock, [&] { return comm->done == comm->workers.size(); });
+        }
+        comm->reduce_us += ggml_time_us() - t_reduce;
+        const int64_t finish_us = ggml_time_us();
+        const int64_t post_arrival_us = max_arrival_us > 0 && finish_us > max_arrival_us ? finish_us - max_arrival_us : 0;
+        comm->post_arrival_us += post_arrival_us;
+        comm->max_post_arrival_us = std::max(comm->max_post_arrival_us, post_arrival_us);
+        if (std::getenv("GGML_CPU_COMM_PROFILE_VERBOSE") != nullptr) {
+            const char * path = std::getenv("GGML_CPU_COMM_PROFILE");
+            FILE * f = (path == nullptr || strcmp(path, "1") == 0 || strcmp(path, "stderr") == 0) ? stderr : fopen(path, "a");
+            if (f != nullptr) {
+                std::fprintf(f,
+                        "cpu-comm-boundary call=%llu name=%s nbytes=%zu sync_us=%lld arrival_skew_us=%lld post_arrival_us=%lld compute_flags=[%d,%d,%d,%d] compute_us=[%lld,%lld,%lld,%lld] start_us=[%lld,%lld,%lld,%lld] end_us=[%lld,%lld,%lld,%lld]\n",
+                        (unsigned long long) comm->calls, tensors[0]->name, nbytes, (long long) sync_us,
+                        (long long) arrival_skew_us, (long long) post_arrival_us,
+                        n_backends > 0 ? rank_compute_flags[0] : 0,
+                        n_backends > 1 ? rank_compute_flags[1] : 0,
+                        n_backends > 2 ? rank_compute_flags[2] : 0,
+                        n_backends > 3 ? rank_compute_flags[3] : 0,
+                        (long long) (n_backends > 0 ? rank_compute_us[0] : 0),
+                        (long long) (n_backends > 1 ? rank_compute_us[1] : 0),
+                        (long long) (n_backends > 2 ? rank_compute_us[2] : 0),
+                        (long long) (n_backends > 3 ? rank_compute_us[3] : 0),
+                        (long long) (n_backends > 0 ? rank_start_us[0] : 0),
+                        (long long) (n_backends > 1 ? rank_start_us[1] : 0),
+                        (long long) (n_backends > 2 ? rank_start_us[2] : 0),
+                        (long long) (n_backends > 3 ? rank_start_us[3] : 0),
+                        (long long) (n_backends > 0 ? rank_end_us[0] : 0),
+                        (long long) (n_backends > 1 ? rank_end_us[1] : 0),
+                        (long long) (n_backends > 2 ? rank_end_us[2] : 0),
+                        (long long) (n_backends > 3 ? rank_end_us[3] : 0));
+                if (f != stderr) {
+                    fclose(f);
+                }
+            }
+        }
+        return true;
+    }
+
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_cpu_comm_dump_tensor("pre", tensors[j], j);
+    }
+
+    const int64_t t_reduce = ggml_time_us();
     float *       acc = NULL;
     for (size_t j = 0; j < n_backends; j++) {
         if ((tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -1356,6 +1698,9 @@ static bool ggml_backend_cpu_comm_allreduce_tensor(void * comm_ctx, struct ggml_
             }
         }
     }
+    comm->reduce_us += ggml_time_us() - t_reduce;
+
+    const int64_t t_bcast = ggml_time_us();
     for (size_t j = 0; j < n_backends; j++) {
         float * data = (float *)tensors[j]->data;
         if (data == acc) {
@@ -1367,17 +1712,107 @@ static bool ggml_backend_cpu_comm_allreduce_tensor(void * comm_ctx, struct ggml_
             memset(data, 0, nbytes);
         }
     }
+    comm->bcast_us += ggml_time_us() - t_bcast;
+
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_cpu_comm_dump_tensor("post", tensors[j], j);
+    }
+
+    const int64_t finish_us = ggml_time_us();
+    if (!comm->focus_ready.empty() && comm->focus_count < comm->focus_ready.size()) {
+        auto & r = comm->focus_ready[comm->focus_count++];
+        r.call = comm->calls;
+        r.ready = finish_us;
+        snprintf(r.name, sizeof(r.name), "%s", tensors[0]->name);
+    } else if (!comm->focus_ready.empty()) {
+        comm->focus_dropped++;
+    }
+    const int64_t post_arrival_us = max_arrival_us > 0 && finish_us > max_arrival_us ? finish_us - max_arrival_us : 0;
+    comm->post_arrival_us += post_arrival_us;
+    comm->max_post_arrival_us = std::max(comm->max_post_arrival_us, post_arrival_us);
+
+    if (std::getenv("GGML_CPU_COMM_PROFILE_VERBOSE") != nullptr) {
+        const char * path = std::getenv("GGML_CPU_COMM_PROFILE");
+        FILE * f = (path == nullptr || strcmp(path, "1") == 0 || strcmp(path, "stderr") == 0) ? stderr : fopen(path, "a");
+        if (f != nullptr) {
+            std::fprintf(f,
+                    "cpu-comm-boundary call=%llu name=%s nbytes=%zu sync_us=%lld arrival_skew_us=%lld post_arrival_us=%lld compute_flags=[%d,%d,%d,%d] compute_us=[%lld,%lld,%lld,%lld] start_us=[%lld,%lld,%lld,%lld] end_us=[%lld,%lld,%lld,%lld]\n",
+                    (unsigned long long) comm->calls, tensors[0]->name, nbytes, (long long) sync_us,
+                    (long long) arrival_skew_us, (long long) post_arrival_us,
+                    n_backends > 0 ? rank_compute_flags[0] : 0,
+                    n_backends > 1 ? rank_compute_flags[1] : 0,
+                    n_backends > 2 ? rank_compute_flags[2] : 0,
+                    n_backends > 3 ? rank_compute_flags[3] : 0,
+                    (long long) (n_backends > 0 ? rank_compute_us[0] : 0),
+                    (long long) (n_backends > 1 ? rank_compute_us[1] : 0),
+                    (long long) (n_backends > 2 ? rank_compute_us[2] : 0),
+                    (long long) (n_backends > 3 ? rank_compute_us[3] : 0),
+                    (long long) (n_backends > 0 ? rank_start_us[0] : 0),
+                    (long long) (n_backends > 1 ? rank_start_us[1] : 0),
+                    (long long) (n_backends > 2 ? rank_start_us[2] : 0),
+                    (long long) (n_backends > 3 ? rank_start_us[3] : 0),
+                    (long long) (n_backends > 0 ? rank_end_us[0] : 0),
+                    (long long) (n_backends > 1 ? rank_end_us[1] : 0),
+                    (long long) (n_backends > 2 ? rank_end_us[2] : 0),
+                    (long long) (n_backends > 3 ? rank_end_us[3] : 0));
+            if (f != stderr) {
+                fclose(f);
+            }
+        }
+    }
 
     return true;
 }
 
 static void ggml_backend_cpu_comm_free(void * comm_ctx) {
-    delete (struct ggml_backend_cpu_comm *)comm_ctx;
+    struct ggml_backend_cpu_comm * comm = (struct ggml_backend_cpu_comm *)comm_ctx;
+    if (const char * path = std::getenv("GGML_CPU_COMM_PROFILE")) {
+        FILE * f = (strcmp(path, "1") == 0 || strcmp(path, "stderr") == 0) ? stderr : fopen(path, "a");
+        if (f != nullptr) {
+            std::fprintf(f,
+                    "cpu-comm-profile calls=%llu bytes=%llu sync_us=%lld reduce_us=%lld bcast_us=%lld arrival_skew_us=%lld post_arrival_us=%lld max_arrival_skew_us=%lld max_post_arrival_us=%lld workers=%zu\n",
+                    (unsigned long long) comm->calls, (unsigned long long) comm->bytes,
+                    (long long) comm->sync_us, (long long) comm->reduce_us, (long long) comm->bcast_us,
+                    (long long) comm->arrival_skew_us, (long long) comm->post_arrival_us,
+                    (long long) comm->max_arrival_skew_us, (long long) comm->max_post_arrival_us,
+                    comm->workers.size());
+            if (f != stderr) {
+                std::fclose(f);
+            }
+        }
+    }
+    if (!comm->focus_ready.empty()) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.ready.%p.%lld.tsv", std::getenv("GGML_CPU_FOCUS"), (void *) comm, (long long) (comm->focus_count ? comm->focus_ready[0].ready : ggml_time_us()));
+        if (FILE * f = fopen(path, "w")) {
+            fprintf(f, "# count=%zu dropped=%zu\ncall\tready\tname\n", comm->focus_count, comm->focus_dropped);
+            for (size_t i = 0; i < comm->focus_count; ++i) {
+                const auto & r = comm->focus_ready[i];
+                fprintf(f, "%llu\t%lld\t%s\n", (unsigned long long) r.call, (long long) r.ready, r.name);
+            }
+            fclose(f);
+        }
+    }
+    if (!comm->workers.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(comm->mutex);
+            comm->stop = true;
+        }
+        comm->cv_start.notify_all();
+        for (std::thread & worker : comm->workers) {
+            worker.join();
+        }
+    }
+    delete comm;
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
+        return (void *)fct;
+    }
+    if (strcmp(name, "ggml_backend_graph_compute_borrowed") == 0) {
+        ggml_backend_graph_compute_borrowed_t fct = ggml_backend_cpu_graph_compute_borrowed;
         return (void *)fct;
     }
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {

@@ -197,6 +197,10 @@ typedef void * thread_ret_t;
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__gnu_linux__)
+#include <sys/mman.h>
+#include <dirent.h>
+#endif
 
 #endif
 
@@ -476,6 +480,53 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
+#define GGML_CPU_FOCUS_CAPACITY 131072
+#define GGML_CPU_FOCUS_WORKERS_CAPACITY 32768
+struct ggml_cpu_focus_worker_record {
+    uint64_t sequence;
+    int ith;
+    int64_t start, end, quant, release, rows;
+    uintptr_t weights, input;
+    size_t weight_bytes;
+    int64_t observed, previous_done;
+    bool waited;
+};
+struct ggml_cpu_focus_record {
+    uint64_t sequence;
+    int index, fused, nth, flags;
+    int64_t start, end, work, tail;
+    uintptr_t tensor, src[GGML_MAX_SRC], data;
+    int64_t ne[4], src_ne[4];
+    char name[GGML_MAX_NAME], weight[GGML_MAX_NAME], op[32];
+};
+
+#define GGML_CPU_POLL_HISTORY 64
+#define GGML_CPU_POLL_CAPACITY 65536
+// Each worker keeps a rolling prehistory and saves it only for the target graph.
+struct ggml_cpu_poll_event {
+    uint64_t serial, rounds, budget;
+    int64_t time;
+    int graph, previous, event, site;
+};
+struct ggml_cpu_poll_snapshot {
+    uint64_t sequence;
+    struct ggml_cpu_poll_event event;
+};
+struct ggml_cpu_poll_worker {
+    struct ggml_cpu_poll_event history[GGML_CPU_POLL_HISTORY];
+    struct ggml_cpu_poll_snapshot * saved;
+    uint64_t serial;
+    size_t count, dropped;
+    int site, reason;
+    bool enabled;
+};
+struct ggml_cpu_poll_publication {
+    uint64_t sequence;
+    int graph, nth;
+    int64_t before, after;
+    char first[GGML_MAX_NAME], last[GGML_MAX_NAME];
+};
+
 // Threadpool def
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
@@ -499,8 +550,18 @@ struct ggml_threadpool {
     int          n_threads;   // Number of threads in the pool
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
+    bool         poll_inactive;
 
     enum ggml_status ec;
+    struct ggml_cpu_focus_record * focus;
+    size_t focus_count, focus_dropped;
+    uint64_t focus_sequence;
+    int focus_rank;
+    struct ggml_tensor * focus_mat_node;
+    struct ggml_cpu_focus_worker_record * focus_workers;
+    size_t focus_workers_count, focus_workers_dropped;
+    struct ggml_cpu_poll_publication * poll_publications;
+    size_t poll_count, poll_dropped;
 };
 
 // Per-thread state
@@ -517,8 +578,47 @@ struct ggml_compute_state {
     // per-node profiling scratch, parity-indexed so thread 0 can fold one
     // node while the team writes the next (see GGML_CPU_PROFILE)
     int64_t prof_work[2];
+    int64_t prof_start[2];
+    int64_t focus_phase[2], focus_rows;
+    uintptr_t focus_weights;
+    int64_t focus_observed, focus_done, focus_previous_done;
+    bool focus_waited;
+    struct ggml_cpu_poll_worker * poll_trace;
+
     int64_t prof_fin[2];
 };
+
+// Event IDs: 1 poll entry, 2 active observation, 3 inactive observation, 4 poll exit,
+// 5 mutex recheck, 6 wait entry, 7 wait return, 8 first op entry, 9 graph done, 10 predecessor entry.
+// Sites: 1 polling, 2 mutex. Exit reasons: 0 budget, 1 active, 2 inactive, 3 pending, 4 stop, 5 pause.
+static void ggml_cpu_poll_event(struct ggml_compute_state * state, int event, int graph, int previous, uint64_t rounds, uint64_t budget) {
+    struct ggml_cpu_poll_worker * p = state->poll_trace;
+    if (!p || !p->enabled) return;
+    struct ggml_cpu_poll_event * e = &p->history[p->serial % GGML_CPU_POLL_HISTORY];
+    e->serial = ++p->serial;
+    e->time = ggml_time_us();
+    e->graph = graph;
+    e->previous = previous;
+    e->event = event;
+    e->site = p->site;
+    e->rounds = rounds;
+    e->budget = budget;
+}
+
+static void ggml_cpu_poll_save(struct ggml_compute_state * state, uint64_t sequence) {
+    struct ggml_cpu_poll_worker * p = state->poll_trace;
+    if (!p) return;
+    const uint64_t begin = p->serial > GGML_CPU_POLL_HISTORY ? p->serial - GGML_CPU_POLL_HISTORY : 0;
+    for (uint64_t i = begin; i < p->serial; ++i) {
+        if (p->count == GGML_CPU_POLL_CAPACITY) {
+            p->dropped++;
+            continue;
+        }
+        struct ggml_cpu_poll_snapshot * r = &p->saved[p->count++];
+        r->sequence = sequence;
+        r->event = p->history[i % GGML_CPU_POLL_HISTORY];
+    }
+}
 
 // Helpers for polling loops
 #if defined(__aarch64__) && ( defined(__clang__) || defined(__GNUC__) )
@@ -577,9 +677,96 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
+// NUMA mirror: use a two-level barrier during mirrored decode so all worker
+// threads on one socket synchronize on a node-local cache line and only one
+// leader per socket contends on the cross-node line. This ports the low-risk
+// synchronization idea from ik_llama-numa without changing kernels/scheduler.
+#define GGML_NUMA_BARRIER_LINE 64
+struct ggml_numa_barrier_node {
+    atomic_int arrive;
+    char pad0[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
+    atomic_int release;
+    char pad1[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
+};
+
+static struct {
+    struct ggml_numa_barrier_node * node[GGML_NUMA_MAX_NODES];
+    atomic_int global_arrive;
+    char pad[GGML_NUMA_BARRIER_LINE];
+    atomic_int global_release;
+    int node_nth[GGML_NUMA_MAX_NODES];
+    int n_leaders;
+    int active;
+} g_numa_barrier;
+
+static __thread int tl_numa_node = 0;
+
+static bool ggml_cpu_trace_ops;
+static const char * ggml_cpu_trace_ops_path;
+static const char * ggml_cpu_trace_ops_boundary_filter;
+static FILE * ggml_cpu_trace_ops_file;
+static bool ggml_cpu_mmid_trace;
+static const char * ggml_cpu_mmid_trace_path;
+static int ggml_cpu_current_numa_node(void);
+
+static inline void ggml_numa_spin_pause(void) {
+    ggml_thread_cpu_relax();
+}
+
+static int ggml_numa_node_for_thread_local(int ith, int nth) {
+    const int n = (int) g_state.numa.n_nodes;
+    if (n <= 1 || nth <= 0) {
+        return 0;
+    }
+    int node = (ith * n) / nth;
+    if (node >= n) {
+        node = n - 1;
+    }
+    return node;
+}
+
+static void ggml_numa_hier_barrier(void) {
+    const int node = tl_numa_node;
+    const int node_nth = node >= 0 && node < GGML_NUMA_MAX_NODES ? g_numa_barrier.node_nth[node] : 0;
+
+    if (node_nth > 1) {
+        struct ggml_numa_barrier_node * nb = g_numa_barrier.node[node];
+        const int rel_old = atomic_load_explicit(&nb->release, memory_order_relaxed);
+        if (atomic_fetch_add_explicit(&nb->arrive, 1, memory_order_acq_rel) != node_nth - 1) {
+            while (atomic_load_explicit(&nb->release, memory_order_acquire) == rel_old) {
+                ggml_numa_spin_pause();
+            }
+            return;
+        }
+        atomic_store_explicit(&nb->arrive, 0, memory_order_release);
+    }
+
+    const int n_leaders = g_numa_barrier.n_leaders;
+    if (n_leaders > 1) {
+        const int g_old = atomic_load_explicit(&g_numa_barrier.global_release, memory_order_relaxed);
+        if (atomic_fetch_add_explicit(&g_numa_barrier.global_arrive, 1, memory_order_acq_rel) == n_leaders - 1) {
+            atomic_store_explicit(&g_numa_barrier.global_arrive, 0, memory_order_release);
+            atomic_fetch_add_explicit(&g_numa_barrier.global_release, 1, memory_order_acq_rel);
+        } else {
+            while (atomic_load_explicit(&g_numa_barrier.global_release, memory_order_acquire) == g_old) {
+                ggml_numa_spin_pause();
+            }
+        }
+    }
+
+    if (node_nth > 1) {
+        atomic_fetch_add_explicit(&g_numa_barrier.node[node]->release, 1, memory_order_acq_rel);
+    }
+}
+
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
+        return;
+    }
+
+    if (g_numa_barrier.active) {
+        ggml_numa_hier_barrier();
         return;
     }
 
@@ -635,6 +822,100 @@ static cpu_set_t ggml_get_numa_affinity(void) {
 #else
 static uint32_t ggml_get_numa_affinity(void) {
     return 0; // no NUMA support
+}
+#endif
+
+#if defined(__gnu_linux__)
+static int ggml_numa_mirror_read_sysfs_hex(const char * dev, const char * attr, unsigned * out) {
+    char path[512];
+    int rv = snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/%s", dev, attr);
+    GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+    FILE * f = fopen(path, "r");
+    if (f == NULL) {
+        return -1;
+    }
+    rv = fscanf(f, "%x", out) == 1 ? 0 : -1;
+    fclose(f);
+    return rv;
+}
+
+// The home node holds the primary weights: GPU op-offload uploads read from it, so it should be the node the GPUs hang off.
+// Runs before any backend is initialized, so the GPUs are found via a sysfs PCI scan rather than the backend API: display-class devices (0x03xx) from discrete-GPU vendors, majority vote on their numa_node.
+// The vendor filter skips the BMC VGA every server board has on node 0. GGML_NUMA_MIRROR_HOME=<n> overrides.
+static int ggml_numa_mirror_pick_home_node(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char * e = getenv("GGML_NUMA_MIRROR_HOME");
+    if (e != NULL && e[0]) {
+        int h = atoi(e);
+        cached = h >= 0 && h < GGML_NUMA_MAX_NODES ? h : 0;
+        GGML_LOG_INFO("NUMA mirror: home node %d (GGML_NUMA_MIRROR_HOME)\n", cached);
+        return cached;
+    }
+    int votes[GGML_NUMA_MAX_NODES] = { 0 };
+    DIR * d = opendir("/sys/bus/pci/devices");
+    if (d != NULL) {
+        struct dirent * de;
+        while ((de = readdir(d)) != NULL) {
+            unsigned cls = 0, vendor = 0;
+            if (de->d_name[0] == '.') {
+                continue;
+            }
+            if (ggml_numa_mirror_read_sysfs_hex(de->d_name, "class", &cls) != 0 || (cls >> 16) != 0x03) {
+                continue;
+            }
+            if (ggml_numa_mirror_read_sysfs_hex(de->d_name, "vendor", &vendor) != 0 || (vendor != 0x10de && vendor != 0x1002)) {
+                continue;
+            }
+            char path[512];
+            int rv = snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", de->d_name);
+            GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+            FILE * f = fopen(path, "r");
+            if (f == NULL) {
+                continue;
+            }
+            int node = -1;
+            if (fscanf(f, "%d", &node) == 1 && node >= 0 && node < GGML_NUMA_MAX_NODES) {
+                votes[node]++;
+            }
+            fclose(f);
+        }
+        closedir(d);
+    }
+    int home = 0, best = 0, n_gpus = 0;
+    for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+        n_gpus += votes[n];
+        if (votes[n] > best) {
+            best = votes[n];
+            home = n;
+        }
+    }
+    cached = home;
+    if (n_gpus > 0) {
+        GGML_LOG_INFO("NUMA mirror: home node %d (%d of %d GPUs)\n", home, best, n_gpus);
+    } else {
+        GGML_LOG_INFO("NUMA mirror: home node 0 (no GPUs found)\n");
+    }
+    return cached;
+}
+
+// mirror mode wants the primary weights on one node with replicas elsewhere - prefer the home node for every allocation made from here on, which is what `numactl --membind=<home>` achieves but degrading instead of failing when the node is full
+// called before any weight buffer is allocated; the compute threads spawn later and inherit the policy
+static void ggml_numa_mirror_set_home_policy(int home) {
+    int mode = 0;
+    if (syscall(__NR_get_mempolicy, &mode, NULL, 0, NULL, 0) == 0 && mode != 0) {
+        GGML_LOG_INFO("NUMA mirror: an explicit memory policy is already set, leaving it in place\n");
+        return;
+    }
+    unsigned long nodemask = 1ul << home;
+    // MPOL_PREFERRED = 1 (numaif.h not required at build time)
+    if (syscall(__NR_set_mempolicy, 1l, &nodemask, sizeof(nodemask)*8) == 0) {
+        GGML_LOG_INFO("NUMA mirror: memory policy set to prefer node %d\n", home);
+    } else {
+        GGML_LOG_WARN("NUMA mirror: set_mempolicy failed - if the model does not load on node %d, launch with `numactl --membind=%d`\n", home, home);
+    }
 }
 #endif
 
@@ -720,6 +1001,10 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
             fclose(fptr);
         }
     }
+
+    if (numa_flag == GGML_NUMA_STRATEGY_MIRROR && g_state.numa.n_nodes > 1) {
+        ggml_numa_mirror_set_home_policy(ggml_numa_mirror_pick_home_node());
+    }
 #else
     UNUSED(numa_flag);
     // TODO
@@ -729,6 +1014,489 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
 }
+
+//
+// NUMA weight mirroring (--numa mirror)
+//
+// Keeps a full per-NUMA-node replica of large host weight buffers so that the CPU GEMM paths (mul_mat / mul_mat_id) read weights from node-local memory instead of interleaved/remote pages.
+// The primary copy stays as tensor->data on the home node (picked from GPU PCIe affinity, see ggml_numa_mirror_pick_home_node); other nodes get an mmap'd replica. Threads pick their copy via getcpu() at op entry.
+// The scheduler sources expert-weight uploads from the replica local to the destination GPU (ggml_numa_mirror_remap_node).
+// Buffers are discovered lazily at graph_compute time (ggml_numa_mirror_scan_graph): no allocator hooks, so any loader path that populates weights before the first compute is covered. Replicas are dropped when the owning buffer is freed (ggml_sched_set_buffer_free_notify).
+//
+
+#define GGML_NUMA_MIRROR_MAX_BUFS 16
+
+#if defined(__gnu_linux__)
+
+struct ggml_numa_mirror_buf {
+    struct ggml_backend_buffer * owner; // for stale-entry detection on address reuse
+    void *  base;
+    size_t  size;
+    void *  replica[GGML_NUMA_MAX_NODES]; // replica[home] == base
+};
+
+static struct {
+    atomic_int n_bufs;
+    struct ggml_numa_mirror_buf bufs[GGML_NUMA_MIRROR_MAX_BUFS];
+    int     n_nodes;
+    int     home_node;
+    size_t  min_bytes;
+    int     enabled; // -1 = not yet parsed
+    // reported once: a mirror that engages on 0% of the weights is a net loss and must not be silent
+    size_t  bytes_mirrored;
+    size_t  bytes_skipped;
+    int     reported;
+} g_numa_mirror = { 0, {{0}}, 0, 0, 0, -1, 0, 0, 0 };
+
+// serializes register/unregister (two llama contexts in one process may compute concurrently); the remap hot path stays lock-free
+static pthread_mutex_t g_numa_mirror_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define GGML_NUMA_MIRROR_LOG_INFO(...) GGML_LOG_INFO("NUMA mirror: " __VA_ARGS__)
+#define GGML_NUMA_MIRROR_LOG_WARN(...) GGML_LOG_WARN("NUMA mirror: " __VA_ARGS__)
+
+static int ggml_numa_mirror_count_nodes(void) {
+    if (g_state.numa.n_nodes > 0) {
+        return (int) g_state.numa.n_nodes;
+    }
+    struct stat st;
+    char path[256];
+    int n = 0;
+    while (n < GGML_NUMA_MAX_NODES) {
+        int rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%d", n);
+        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+        if (stat(path, &st) != 0) { break; }
+        ++n;
+    }
+    return n;
+}
+
+static int ggml_numa_mirror_current_node(void) {
+    unsigned int cpu  = 0;
+    unsigned int node = 0;
+#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
+    if (getcpu(&cpu, &node) != 0) { return 0; }
+#else
+#   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
+#       define SYS_getcpu SYS_get_cpu
+#   endif
+    if (syscall(SYS_getcpu, &cpu, &node) != 0) { return 0; }
+#endif
+    return (int) node;
+}
+
+// bind the page-aligned interior of the range to a single node; optionally migrate pages already faulted elsewhere (MPOL_MF_MOVE only touches pages exclusive to this process, so no CAP_SYS_NICE needed)
+static bool ggml_numa_mirror_bind_pages(void * addr, size_t size, int node, bool move) {
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    uintptr_t first = ((uintptr_t) addr + page - 1) & ~(page - 1);
+    uintptr_t last  = ((uintptr_t) addr + size) & ~(page - 1);
+    if (last <= first) {
+        return true;
+    }
+    unsigned long nodemask = 1ul << node;
+    // MPOL_BIND = 2, MPOL_MF_MOVE = 2 (numaif.h not required at build time)
+    long rv = syscall(__NR_mbind, first, last - first, 2l, &nodemask, sizeof(nodemask)*8, move ? 2ul : 0ul);
+    return rv == 0;
+}
+
+// free memory including reclaimable page cache - bare MemFree refuses to replicate on a node that only holds file cache the kernel would evict on demand
+static long long ggml_numa_mirror_node_free_bytes(int node) {
+    char path[256];
+    int rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", node);
+    GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+    FILE * f = fopen(path, "r");
+    if (f == NULL) {
+        return -1;
+    }
+    char line[256];
+    long long free_kb = -1, inactive_file_kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        long long v;
+        if (sscanf(line, "Node %*d MemFree: %lld kB", &v) == 1) {
+            free_kb = v;
+        } else if (sscanf(line, "Node %*d Inactive(file): %lld kB", &v) == 1) {
+            inactive_file_kb = v;
+        }
+    }
+    fclose(f);
+    return free_kb < 0 ? -1 : (free_kb + inactive_file_kb) * 1024;
+}
+
+// sample where a range's pages actually live, to avoid paying for a migration that cannot work (pinned host pages are unmovable)
+// returns the fraction (0..1) of sampled pages already on `node`
+static double ggml_numa_mirror_local_fraction(void * addr, size_t size, int node) {
+    enum { N_SAMPLES = 512 };
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    if (size < page) {
+        return 1.0;
+    }
+    void * pages[N_SAMPLES];
+    int    status[N_SAMPLES];
+    const size_t n_pages = size / page;
+    const size_t stride  = n_pages > N_SAMPLES ? n_pages / N_SAMPLES : 1;
+    int n = 0;
+    for (size_t i = 0; i < n_pages && n < N_SAMPLES; i += stride) {
+        pages[n++] = (char *) addr + i * page;
+    }
+    for (int i = 0; i < n; ++i) {
+        status[i] = -1;
+    }
+    // move_pages with no target nodes = query current placement
+    if (syscall(__NR_move_pages, 0, (unsigned long) n, pages, NULL, status, 0) != 0) {
+        return -1.0;
+    }
+    int local = 0, valid = 0;
+    for (int i = 0; i < n; ++i) {
+        if (status[i] >= 0) {
+            ++valid;
+            if (status[i] == node) { ++local; }
+        }
+    }
+    return valid == 0 ? -1.0 : (double) local / (double) valid;
+}
+
+bool ggml_numa_mirror_enabled(void) {
+    if (g_numa_mirror.enabled < 0) {
+        // ggml_numa_init() runs at backend init, before any weight buffer registers here, so the strategy is settled by the time this gate is first evaluated
+        bool on = g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR;
+        if (on) {
+            g_numa_mirror.n_nodes = ggml_numa_mirror_count_nodes();
+            if (g_numa_mirror.n_nodes < 2) {
+                GGML_NUMA_MIRROR_LOG_WARN("requested but only %d node(s) present - disabled\n", g_numa_mirror.n_nodes);
+                on = false;
+            }
+        }
+        const char * mb = getenv("GGML_NUMA_MIRROR_MIN_MB");
+        g_numa_mirror.min_bytes = mb != NULL ? strtoull(mb, NULL, 10) << 20 : 1ull << 30;
+        g_numa_mirror.home_node = ggml_numa_mirror_pick_home_node();
+        g_numa_mirror.enabled = on ? 1 : 0;
+        if (on) {
+            GGML_NUMA_MIRROR_LOG_INFO("%d nodes, home node %d, min buffer %zu MiB\n",
+                    g_numa_mirror.n_nodes, g_numa_mirror.home_node, g_numa_mirror.min_bytes >> 20);
+        }
+    }
+    return g_numa_mirror.enabled == 1;
+}
+
+static void * ggml_numa_mirror_alloc_replica(size_t size, int node) {
+    long long free_bytes = ggml_numa_mirror_node_free_bytes(node);
+    if (free_bytes >= 0 && (unsigned long long) free_bytes < size + (2ull << 30)) {
+        GGML_NUMA_MIRROR_LOG_WARN("node %d has only %.1f GiB free (incl. reclaimable), need %.1f GiB - skipping replica\n",
+                node, free_bytes / (1024.0*1024.0*1024.0), (size + (2ull << 30)) / (1024.0*1024.0*1024.0));
+        return NULL;
+    }
+    void * mem = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        GGML_NUMA_MIRROR_LOG_WARN("mmap of %zu bytes for node %d replica failed\n", size, node);
+        return NULL;
+    }
+    if (!ggml_numa_mirror_bind_pages(mem, size, node, false)) {
+        GGML_NUMA_MIRROR_LOG_WARN("mbind to node %d failed\n", node);
+        munmap(mem, size);
+        return NULL;
+    }
+    return mem;
+}
+
+static void ggml_numa_mirror_copy(void * dst, const void * src, size_t size) {
+    const size_t chunk = 64ull << 20;
+    const int64_t n_chunks = (int64_t) ((size + chunk - 1) / chunk);
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int64_t i = 0; i < n_chunks; ++i) {
+        const size_t off = (size_t) i * chunk;
+        memcpy((char *) dst + off, (const char *) src + off, MIN(chunk, size - off));
+    }
+}
+
+// drop the replicas of a dying buffer; called for every buffer free via the scheduler notify, so it must be cheap when the table is empty
+void ggml_numa_mirror_buffer_freed(struct ggml_backend_buffer * buffer) {
+    const int n = atomic_load_explicit(&g_numa_mirror.n_bufs, memory_order_acquire);
+    if (n == 0) {
+        return;
+    }
+    pthread_mutex_lock(&g_numa_mirror_mutex);
+    for (int i = 0; i < n; ++i) {
+        struct ggml_numa_mirror_buf * mb = &g_numa_mirror.bufs[i];
+        if (mb->owner != buffer || mb->base == NULL) {
+            continue;
+        }
+        // tombstone before unmapping: size 0 makes the entry unmatchable for lock-free readers, and no reader of a buffer being freed can still be in a GEMM on it
+        void * replicas[GGML_NUMA_MAX_NODES];
+        memcpy(replicas, mb->replica, sizeof(replicas));
+        const size_t sz = mb->size;
+        mb->size  = 0;
+        mb->base  = NULL;
+        mb->owner = NULL;
+        for (int nd = 0; nd < GGML_NUMA_MAX_NODES; ++nd) {
+            if (nd != g_numa_mirror.home_node && replicas[nd] != NULL) {
+                munmap(replicas[nd], sz);
+            }
+            mb->replica[nd] = NULL;
+        }
+    }
+    pthread_mutex_unlock(&g_numa_mirror_mutex);
+}
+
+void ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base, size_t size) {
+    if (!ggml_numa_mirror_enabled() || size < g_numa_mirror.min_bytes) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_numa_mirror_mutex);
+    int n = atomic_load_explicit(&g_numa_mirror.n_bufs, memory_order_acquire);
+    int slot = -1;
+    for (int i = 0; i < n; ++i) {
+        if (g_numa_mirror.bufs[i].base == NULL && slot < 0) {
+            slot = i; // tombstone of a freed buffer, reusable
+            continue;
+        }
+        if (g_numa_mirror.bufs[i].base == base) {
+            if (g_numa_mirror.bufs[i].owner == buffer) {
+                pthread_mutex_unlock(&g_numa_mirror_mutex);
+                return; // already mirrored
+            }
+            // address range reused by a different buffer: drop stale replicas, rebuild
+            GGML_NUMA_MIRROR_LOG_INFO("buffer address %p reused by a new buffer - rebuilding replicas\n", base);
+            for (int nd = 0; nd < GGML_NUMA_MAX_NODES; ++nd) {
+                if (nd != g_numa_mirror.home_node && g_numa_mirror.bufs[i].replica[nd] != NULL) {
+                    munmap(g_numa_mirror.bufs[i].replica[nd], g_numa_mirror.bufs[i].size);
+                }
+                g_numa_mirror.bufs[i].replica[nd] = NULL;
+            }
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (n >= GGML_NUMA_MIRROR_MAX_BUFS) {
+            GGML_NUMA_MIRROR_LOG_WARN("buffer table full, %p (%zu bytes) not mirrored\n", base, size);
+            pthread_mutex_unlock(&g_numa_mirror_mutex);
+            return;
+        }
+        slot = n;
+    }
+
+    const int home = g_numa_mirror.home_node;
+    const double gib = size / (1024.0*1024.0*1024.0);
+    struct ggml_numa_mirror_buf * mb = &g_numa_mirror.bufs[slot];
+    memset(mb, 0, sizeof(*mb));
+    mb->owner = buffer;
+    mb->base  = base;
+    mb->size  = size;
+    mb->replica[home] = base;
+
+    int64_t t1 = ggml_time_us();
+    const double local_before = ggml_numa_mirror_local_fraction(base, size, home);
+    if (local_before < 0.0) {
+        // move_pages query failed - placement is unknown, do not attempt migration or report a bogus percentage
+        GGML_NUMA_MIRROR_LOG_WARN(
+            "cannot probe the primary buffer's page placement (move_pages failed) - "
+            "if the model is not already on node %d, launch with `numactl --membind=%d`\n", home, home);
+    } else if (local_before >= 0.95) {
+        ggml_numa_mirror_bind_pages(base, size, home, false); // policy only, nothing to move
+    } else {
+        // probe on a small prefix before committing to walking the whole buffer
+        const size_t probe = MIN(size, 1ull << 30);
+        ggml_numa_mirror_bind_pages(base, probe, home, true);
+        const double probe_local = ggml_numa_mirror_local_fraction(base, probe, home);
+        if (probe_local >= 0.95) {
+            ggml_numa_mirror_bind_pages(base, size, home, true);
+        } else {
+            GGML_NUMA_MIRROR_LOG_WARN(
+                "primary %.1f GiB is only %.0f%% on node %d and its pages will not migrate "
+                "(pinned host memory cannot be moved). Node-%d threads keep reading it remotely. "
+                "Launch with `numactl --membind=%d` to place it correctly at allocation time.\n",
+                gib, local_before * 100.0, home, home, home);
+        }
+    }
+    const double local_after = ggml_numa_mirror_local_fraction(base, size, home);
+    int64_t t2 = ggml_time_us();
+    if (local_before >= 0.0 && local_after >= 0.0) {
+        GGML_NUMA_MIRROR_LOG_INFO("primary %p %.1f GiB: %.0f%% -> %.0f%% on node %d (%.1f s)\n",
+                base, gib, local_before * 100.0, local_after * 100.0, home, (t2 - t1) / 1e6);
+    }
+
+    int n_replicas = 0;
+    for (int node = 0; node < g_numa_mirror.n_nodes && node < GGML_NUMA_MAX_NODES; ++node) {
+        if (node == home) {
+            continue;
+        }
+        void * rep = ggml_numa_mirror_alloc_replica(size, node);
+        if (rep == NULL) {
+            GGML_NUMA_MIRROR_LOG_WARN("node %d has no replica - its threads read node %d remotely\n", node, home);
+            continue;
+        }
+        ggml_numa_mirror_copy(rep, base, size);
+        mb->replica[node] = rep;
+        ++n_replicas;
+    }
+    int64_t t3 = ggml_time_us();
+    GGML_NUMA_MIRROR_LOG_INFO("%d replica(s) of %.1f GiB built in %.1f s\n", n_replicas, gib, (t3 - t2) / 1e6);
+
+    if (n_replicas > 0) {
+        g_numa_mirror.bytes_mirrored += size;
+    } else {
+        g_numa_mirror.bytes_skipped += size;
+    }
+
+    if (slot == n) {
+        atomic_store_explicit(&g_numa_mirror.n_bufs, n + 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&g_numa_mirror_mutex);
+}
+
+const void * ggml_numa_mirror_remap(const void * p) {
+    const int n = atomic_load_explicit(&g_numa_mirror.n_bufs, memory_order_acquire);
+    if (n == 0) {
+        return p;
+    }
+    int node = tl_numa_node;
+    if (node < 0 || node >= GGML_NUMA_MAX_NODES) {
+        node = ggml_numa_mirror_current_node();
+    }
+    if (node < 0 || node >= GGML_NUMA_MAX_NODES) {
+        return p; // unpinned thread on a node beyond the replica table (>8-node box)
+    }
+    for (int i = 0; i < n; ++i) {
+        const uintptr_t off = (uintptr_t) p - (uintptr_t) g_numa_mirror.bufs[i].base;
+        if (off < g_numa_mirror.bufs[i].size) {
+            const void * rep = g_numa_mirror.bufs[i].replica[node];
+            return rep != NULL ? (const char *) rep + off : p;
+        }
+    }
+    return p; // out-of-range: activations, KV, wdata - always the original pointer
+}
+
+// as above, but for an explicitly named node rather than the calling thread's - the scheduler's upload path needs this: the thread issuing a H2D copy has no relation to the NUMA node the destination GPU hangs off
+const void * ggml_numa_mirror_remap_node(const void * p, int node) {
+    const int n = atomic_load_explicit(&g_numa_mirror.n_bufs, memory_order_acquire);
+    if (n == 0 || node < 0 || node >= GGML_NUMA_MAX_NODES) {
+        return p;
+    }
+    for (int i = 0; i < n; ++i) {
+        const uintptr_t off = (uintptr_t) p - (uintptr_t) g_numa_mirror.bufs[i].base;
+        if (off < g_numa_mirror.bufs[i].size) {
+            const void * rep = g_numa_mirror.bufs[i].replica[node];
+            return rep != NULL ? (const char *) rep + off : p;
+        }
+    }
+    return p;
+}
+
+// called single-threaded from the CPU backend's graph_compute, before the
+// parallel region: registers host weight buffers feeding CPU GEMMs
+void ggml_numa_mirror_scan_graph(const struct ggml_cgraph * cgraph) {
+    if (!ggml_numa_mirror_enabled()) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        const struct ggml_tensor * src0 = node->src[0];
+        if (src0 == NULL || src0->buffer == NULL) {
+            continue;
+        }
+        // repack/AMX extra buffer types report is_host = nullptr although their memory is plain host memory - without this check every repacked weight is excluded from mirroring
+        if (!ggml_backend_cpu_buft_is_mirrorable(src0->buffer->buft)) {
+            continue;
+        }
+        ggml_numa_mirror_register(src0->buffer,
+                ggml_backend_buffer_get_base(src0->buffer),
+                ggml_backend_buffer_get_size(src0->buffer));
+    }
+
+    // one-shot coverage report: below ~50% the node-0 bind cost outweighs the replicas
+    if (!g_numa_mirror.reported) {
+        const size_t mirrored = g_numa_mirror.bytes_mirrored;
+        const size_t skipped  = g_numa_mirror.bytes_skipped;
+        if (mirrored + skipped > 0) {
+            const double pct = 100.0 * mirrored / (double)(mirrored + skipped);
+            GGML_NUMA_MIRROR_LOG_INFO("coverage: %.1f GiB mirrored, %.1f GiB not (%.0f%% of registered weight buffers)\n",
+                    mirrored / (1024.0*1024.0*1024.0), skipped / (1024.0*1024.0*1024.0), pct);
+            if (pct < 50.0) {
+                GGML_NUMA_MIRROR_LOG_WARN("below 50%% coverage the mirror is likely a net loss\n");
+            }
+            g_numa_mirror.reported = 1;
+        }
+    }
+}
+
+#else // !__gnu_linux__
+
+bool ggml_numa_mirror_enabled(void) {
+    return false;
+}
+
+void ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base, size_t size) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(base);
+    GGML_UNUSED(size);
+}
+
+void ggml_numa_mirror_buffer_freed(struct ggml_backend_buffer * buffer) {
+    GGML_UNUSED(buffer);
+}
+
+const void * ggml_numa_mirror_remap(const void * p) {
+    return p;
+}
+
+const void * ggml_numa_mirror_remap_node(const void * p, int node) {
+    GGML_UNUSED(node);
+    return p;
+}
+
+void ggml_numa_mirror_scan_graph(const struct ggml_cgraph * cgraph) {
+    GGML_UNUSED(cgraph);
+}
+
+#endif // __gnu_linux__
+
+static void ggml_numa_barrier_setup(int n_threads) {
+    if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_MIRROR || g_state.numa.n_nodes < 2 || n_threads <= 1) {
+        g_numa_barrier.active = 0;
+        return;
+    }
+
+#if defined(__gnu_linux__)
+    const int n = (int) g_state.numa.n_nodes;
+    if (g_numa_barrier.node[0] == NULL) {
+        for (int k = 0; k < n; ++k) {
+            g_numa_barrier.node[k] = (struct ggml_numa_barrier_node *) ggml_numa_mirror_alloc_replica(sizeof(struct ggml_numa_barrier_node), k);
+            if (g_numa_barrier.node[k] == NULL) {
+                for (int j = 0; j < k; ++j) {
+                    munmap(g_numa_barrier.node[j], sizeof(struct ggml_numa_barrier_node));
+                    g_numa_barrier.node[j] = NULL;
+                }
+                g_numa_barrier.active = 0;
+                return;
+            }
+            memset(g_numa_barrier.node[k], 0, sizeof(struct ggml_numa_barrier_node));
+        }
+        atomic_store_explicit(&g_numa_barrier.global_arrive, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_barrier.global_release, 0, memory_order_relaxed);
+    }
+
+    int leaders = 0;
+    for (int k = 0; k < n; ++k) {
+        const int first_k  = ( k      * n_threads + n - 1) / n;
+        const int first_k1 = ((k + 1) * n_threads + n - 1) / n;
+        g_numa_barrier.node_nth[k] = first_k1 - first_k;
+        if (g_numa_barrier.node_nth[k] > 0) {
+            ++leaders;
+        }
+    }
+    g_numa_barrier.n_leaders = leaders;
+    g_numa_barrier.active = 1;
+#else
+    GGML_UNUSED(n_threads);
+    g_numa_barrier.active = 0;
+#endif
+}
+
 
 #if defined(__ARM_ARCH)
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
@@ -1197,6 +1965,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
         return;
     }
 
+    const char * src0_base = (const char *) ggml_numa_mirror_remap(src0->data);
+
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1228,7 +1998,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 const int64_t i2 = i12;
                 const int64_t i3 = i13;
 
-                const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
+                const char * src0_row = src0_base + (0 + i02 * nb02 + i03 * nb03);
 
                 // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
                 //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
@@ -1304,12 +2074,14 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
+    const char * src0_lf = (const char *) ggml_numa_mirror_remap(src0->data);
+
     if (src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+                                     src0_lf + i12/r2*nb02 + i13/r3*nb03,
                                      nb01/ggml_type_size(src0->type),
                                      (const char *)src1->data + i12*nb12 + i13*nb13,
                                      nb11/ggml_type_size(src1->type),
@@ -1377,7 +2149,7 @@ UseGgmlGemm1:;
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+                                     src0_lf + i12/r2*nb02 + i13/r3*nb03,
                                      nb01/ggml_type_size(src0->type),
                                      (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
                                      row_size/ggml_type_size(vec_dot_type),
@@ -1673,6 +2445,28 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        if (ggml_cpu_mmid_trace && ggml_cpu_mmid_trace_path != NULL) {
+            FILE * f = (strcmp(ggml_cpu_mmid_trace_path, "1") == 0 || strcmp(ggml_cpu_mmid_trace_path, "stderr") == 0) ?
+                stderr : fopen(ggml_cpu_mmid_trace_path, "a");
+            if (f != NULL) {
+                fprintf(f,
+                        "cpu-mmid-trace rank=%d node=%s src0=%s type=%s n_expert=%d n_ids=%d ids_cols=%lld dst_ne=[%lld,%lld,%lld,%lld] src0_ne=[%lld,%lld,%lld,%lld] counts=",
+                        ggml_cpu_current_numa_node(), dst->name, src0->name, ggml_type_name(src0->type),
+                        n_as, n_ids, (long long) ids->ne[1],
+                        (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                        (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3]);
+                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                    if (matrix_row_counts[cur_a] != 0) {
+                        fprintf(f, "%s%d:%lld", cur_a == 0 ? "" : ",", cur_a, (long long) matrix_row_counts[cur_a]);
+                    }
+                }
+                fprintf(f, "\n");
+                if (f != stderr) {
+                    fclose(f);
+                }
+            }
+        }
     }
 
     // reset current_chunk
@@ -1690,7 +2484,7 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = (const char *) ggml_numa_mirror_remap(src0->data) + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -2194,7 +2988,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
-static void set_numa_thread_affinity(int thread_n) {
+static void set_numa_thread_affinity(int thread_n, int n_threads) {
     if (!ggml_is_numa()) {
         return;
     }
@@ -2204,6 +2998,17 @@ static void set_numa_thread_affinity(int thread_n) {
     size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
 
     switch(g_state.numa.numa_strategy) {
+        case GGML_NUMA_STRATEGY_MIRROR:
+            // Match ik_llama-numa: assign contiguous blocks of worker ids to
+            // NUMA nodes, so chunk ownership, pointer remap, and the hierarchical
+            // barrier all agree. The previous round-robin mapping scattered
+            // adjacent workers across sockets and paid cross-node sync/cache costs.
+            node_num = ggml_numa_node_for_thread_local(thread_n, n_threads);
+            if (node_num != ggml_numa_mirror_pick_home_node()) {
+                syscall(__NR_set_mempolicy, 0l, NULL, 0);
+            }
+            tl_numa_node = node_num;
+            break;
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
             // run thread on node_num thread_n / (threads per node)
             node_num = thread_n % g_state.numa.n_nodes;
@@ -2262,7 +3067,7 @@ static void clear_numa_thread_affinity(void) {
 #else
 // TODO: Windows etc.
 // (the linux implementation may also work on BSD, someone should test)
-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
+static void set_numa_thread_affinity(int thread_n, int n_threads) { UNUSED(thread_n); UNUSED(n_threads); }
 static void clear_numa_thread_affinity(void) {}
 #endif
 
@@ -2757,6 +3562,93 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
+bool ggml_cpu_focus_mat_enabled(const struct ggml_compute_params * params, const struct ggml_tensor * op) {
+    return params->threadpool && params->threadpool->focus_mat_node == op;
+}
+
+void ggml_cpu_focus_mat_phase(const struct ggml_compute_params * params, int phase, int64_t rows, const void * weights) {
+    struct ggml_compute_state * w = &params->threadpool->workers[params->ith];
+    if (phase < 2) w->focus_phase[phase] = ggml_time_us();
+    if (phase == 0) w->focus_rows = 0;
+    if (phase == 2) {
+        w->focus_rows += rows;
+        w->focus_weights = (uintptr_t) weights;
+    }
+}
+
+void ggml_cpu_focus_set(struct ggml_threadpool * pool, uint64_t sequence, int rank) {
+    if (pool && pool->focus) {
+        pool->focus_sequence = sequence;
+        pool->focus_rank = rank;
+    }
+}
+
+static void ggml_cpu_focus_dump(struct ggml_threadpool * tp) {
+    if (!tp->focus) {
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s.ops.%d.%p.%lld.tsv", getenv("GGML_CPU_FOCUS"), tp->focus_rank, (void *) tp, (long long) (tp->focus_count ? tp->focus[0].start : ggml_time_us()));
+    FILE * f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "# count=%zu dropped=%zu\n", tp->focus_count, tp->focus_dropped);
+        fprintf(f, "seq\tindex\tfused\tnth\tflags\tstart\tend\twork\ttail\ttensor\tsources\tdata\tne\tsrc_ne\tname\tweight\top\n");
+        for (size_t i = 0; i < tp->focus_count; ++i) {
+            const struct ggml_cpu_focus_record * r = &tp->focus[i];
+            fprintf(f, "%llu\t%d\t%d\t%d\t%d\t%lld\t%lld\t%lld\t%lld\t%zx\t",
+                    (unsigned long long) r->sequence, r->index, r->fused, r->nth, r->flags,
+                    (long long) r->start, (long long) r->end, (long long) r->work, (long long) r->tail, (size_t) r->tensor);
+            for (int j = 0; j < GGML_MAX_SRC; ++j) fprintf(f, "%s%zx", j ? "," : "", (size_t) r->src[j]);
+            fprintf(f, "\t%zx\t%lld,%lld,%lld,%lld\t%lld,%lld,%lld,%lld\t%s\t%s\t%s\n", (size_t) r->data,
+                    (long long) r->ne[0], (long long) r->ne[1], (long long) r->ne[2], (long long) r->ne[3],
+                    (long long) r->src_ne[0], (long long) r->src_ne[1], (long long) r->src_ne[2], (long long) r->src_ne[3],
+                    r->name, r->weight, r->op);
+        }
+        fclose(f);
+    }
+    snprintf(path, sizeof(path), "%s.workers.%d.%p.%lld.tsv", getenv("GGML_CPU_FOCUS"), tp->focus_rank, (void *) tp, (long long) (tp->focus_count ? tp->focus[0].start : ggml_time_us()));
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "# count=%zu dropped=%zu\nseq\tith\tstart\tend\tquant\trelease\trows\tweights\tinput\tweight_bytes\tobserved\tprevious_done\twaited\n", tp->focus_workers_count, tp->focus_workers_dropped);
+        for (size_t i = 0; i < tp->focus_workers_count; ++i) {
+            const struct ggml_cpu_focus_worker_record * r = &tp->focus_workers[i];
+            fprintf(f, "%llu\t%d\t%lld\t%lld\t%lld\t%lld\t%lld\t%zx\t%zx\t%zu\t%lld\t%lld\t%d\n", (unsigned long long) r->sequence, r->ith,
+                (long long) r->start, (long long) r->end, (long long) r->quant, (long long) r->release, (long long) r->rows, (size_t) r->weights, (size_t) r->input, r->weight_bytes, (long long) r->observed, (long long) r->previous_done, r->waited);
+        }
+        fclose(f);
+    }
+    if (tp->poll_publications) {
+        snprintf(path, sizeof(path), "%s.publications.%d.%p.%lld.tsv", getenv("GGML_CPU_FOCUS"), tp->focus_rank, (void *) tp, (long long) (tp->focus_count ? tp->focus[0].start : ggml_time_us()));
+        f = fopen(path, "w");
+        GGML_ASSERT(f != NULL);
+        fprintf(f, "# count=%zu dropped=%zu\nseq\tgraph\tnth\tbefore\tafter\tfirst\tlast\n", tp->poll_count, tp->poll_dropped);
+        for (size_t i = 0; i < tp->poll_count; ++i) {
+            const struct ggml_cpu_poll_publication * r = &tp->poll_publications[i];
+            fprintf(f, "%llu\t%d\t%d\t%lld\t%lld\t%s\t%s\n", (unsigned long long) r->sequence, r->graph, r->nth, (long long) r->before, (long long) r->after, r->first, r->last);
+        }
+        GGML_ASSERT(fclose(f) == 0);
+        for (int ith = 1; ith < tp->n_threads; ++ith) {
+            struct ggml_cpu_poll_worker * p = tp->workers[ith].poll_trace;
+            if (!p) continue;
+            snprintf(path, sizeof(path), "%s.poll.%d.%p.%lld.%d.tsv", getenv("GGML_CPU_FOCUS"), tp->focus_rank, (void *) tp, (long long) (tp->focus_count ? tp->focus[0].start : ggml_time_us()), ith);
+            f = fopen(path, "w");
+            GGML_ASSERT(f != NULL);
+            fprintf(f, "# count=%zu dropped=%zu history=%d total_events=%llu\nseq\tserial\ttime\tgraph\tprevious\tevent\tsite\trounds\tbudget\n", p->count, p->dropped, GGML_CPU_POLL_HISTORY, (unsigned long long) p->serial);
+            for (size_t i = 0; i < p->count; ++i) {
+                const struct ggml_cpu_poll_snapshot * r = &p->saved[i];
+                const struct ggml_cpu_poll_event * e = &r->event;
+                fprintf(f, "%llu\t%llu\t%lld\t%d\t%d\t%d\t%d\t%llu\t%llu\n", (unsigned long long) r->sequence, (unsigned long long) e->serial, (long long) e->time, e->graph, e->previous, e->event, e->site, (unsigned long long) e->rounds, (unsigned long long) e->budget);
+            }
+            GGML_ASSERT(fclose(f) == 0);
+            free(p->saved);
+            ggml_aligned_free(p, sizeof(struct ggml_cpu_poll_worker));
+        }
+        free(tp->poll_publications);
+    }
+    free(tp->focus_workers);
+    free(tp->focus);
+}
+
 void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     if (!threadpool) return;
 
@@ -2783,6 +3675,7 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_cond_destroy(&threadpool->cond);
 #endif // GGML_USE_OPENMP
 
+    ggml_cpu_focus_dump(threadpool);
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
     ggml_aligned_free(threadpool->workers, workers_size);
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
@@ -3172,6 +4065,116 @@ static int ggml_cpu_try_fuse_ops(
 static bool ggml_cpu_profile = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 static const char * ggml_cpu_profile_path = NULL;
 
+static int ggml_cpu_current_numa_node(void) {
+#if defined(__gnu_linux__)
+    unsigned cpu = 0;
+    unsigned node = 0;
+#ifdef SYS_getcpu
+    if (syscall(SYS_getcpu, &cpu, &node, NULL) == 0) {
+        return (int) node;
+    }
+#endif
+    for (uint32_t n = 0; n < g_state.numa.n_nodes; n++) {
+        for (uint32_t i = 0; i < g_state.numa.nodes[n].n_cpus; i++) {
+            if (g_state.numa.nodes[n].cpus[i] == cpu) {
+                return (int) n;
+            }
+        }
+    }
+#endif
+    return tl_numa_node;
+}
+
+static bool ggml_cpu_trace_filter_match(const char * name, const char * filter) {
+    if (filter == NULL || filter[0] == '\0') {
+        return true;
+    }
+    const char * p = filter;
+    while (*p != '\0') {
+        while (*p == ',' || *p == ';' || *p == ' ') {
+            p++;
+        }
+        const char * q = p;
+        while (*q != '\0' && *q != ',' && *q != ';' && *q != ' ') {
+            q++;
+        }
+        if (q > p) {
+            char token[128];
+            const size_t n = MIN((size_t) (q - p), sizeof(token) - 1);
+            memcpy(token, p, n);
+            token[n] = '\0';
+            if (strstr(name, token) != NULL) {
+                return true;
+            }
+        }
+        p = q;
+    }
+    return false;
+}
+
+static bool ggml_cpu_trace_graph_enabled(const struct ggml_cgraph * cgraph) {
+    if (!ggml_cpu_trace_ops || cgraph->n_nodes <= 0) {
+        return false;
+    }
+    const struct ggml_tensor * last = cgraph->nodes[cgraph->n_nodes - 1];
+    return last != NULL && ggml_cpu_trace_filter_match(last->name, ggml_cpu_trace_ops_boundary_filter);
+}
+
+static void ggml_cpu_trace_op_fold(
+        const struct ggml_threadpool * tp,
+        const struct ggml_cgraph     * cgraph,
+        int node_n,
+        const struct ggml_tensor     * node,
+        bool fused, int64_t t_bar, int nth, int slot) {
+    int64_t work = 0;
+    int64_t min_start = 0;
+    int64_t max_fin = 0;
+    for (int i = 0; i < nth; i++) {
+        const struct ggml_compute_state * w = &tp->workers[i];
+        work += w->prof_work[slot];
+        if (w->prof_start[slot] > 0) {
+            min_start = min_start == 0 ? w->prof_start[slot] : MIN(min_start, w->prof_start[slot]);
+        }
+        max_fin = MAX(max_fin, w->prof_fin[slot]);
+    }
+    if (min_start == 0 || max_fin == 0) {
+        return;
+    }
+
+    FILE * f = ggml_cpu_trace_ops_file != NULL ? ggml_cpu_trace_ops_file : stderr;
+
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * src1 = node->src[1];
+    const struct ggml_tensor * src2 = node->src[2];
+    ggml_critical_section_start();
+    fprintf(f,
+            "cpu-op-trace rank=%d graph_uid=%llu node_index=%d graph_nodes=%d boundary=%s op=%s node=%s fused=%d nth=%d flags=%d start_us=%lld end_us=%lld wall_us=%lld barrier_tail_us=%lld work_us=%lld type=%s ne=[%lld,%lld,%lld,%lld] src0=%s src0_type=%s src0_ne=[%lld,%lld,%lld,%lld] src1=%s src1_type=%s src1_ne=[%lld,%lld,%lld,%lld] src2=%s src2_type=%s src2_ne=[%lld,%lld,%lld,%lld]\n",
+            ggml_cpu_current_numa_node(),
+            (unsigned long long) cgraph->uid,
+            node_n,
+            cgraph->n_nodes,
+            cgraph->nodes[cgraph->n_nodes - 1]->name,
+            ggml_op_name(node->op),
+            node->name,
+            fused ? 1 : 0,
+            nth,
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
+            (long long) min_start,
+            (long long) max_fin,
+            (long long) (max_fin - min_start),
+            (long long) (t_bar > max_fin ? t_bar - max_fin : 0),
+            (long long) work,
+            ggml_type_name(node->type),
+            (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
+            src0 ? src0->name : "-", src0 ? ggml_type_name(src0->type) : "-",
+            (long long) (src0 ? src0->ne[0] : 0), (long long) (src0 ? src0->ne[1] : 0), (long long) (src0 ? src0->ne[2] : 0), (long long) (src0 ? src0->ne[3] : 0),
+            src1 ? src1->name : "-", src1 ? ggml_type_name(src1->type) : "-",
+            (long long) (src1 ? src1->ne[0] : 0), (long long) (src1 ? src1->ne[1] : 0), (long long) (src1 ? src1->ne[2] : 0), (long long) (src1 ? src1->ne[3] : 0),
+            src2 ? src2->name : "-", src2 ? ggml_type_name(src2->type) : "-",
+            (long long) (src2 ? src2->ne[0] : 0), (long long) (src2 ? src2->ne[1] : 0), (long long) (src2 ? src2->ne[2] : 0), (long long) (src2 ? src2->ne[3] : 0));
+    ggml_critical_section_end();
+}
+
 struct ggml_cpu_profile_entry {
     // key: the fields up to and including `fused` (zero-initialized, so the
     // padding is stable for hashing/comparison)
@@ -3331,6 +4334,63 @@ static void ggml_cpu_profile_dump(void) {
     }
 }
 
+static void ggml_cpu_focus_fold(struct ggml_threadpool * tp, const struct ggml_tensor * node, int index, int fused, int nth, int slot, int64_t barrier) {
+    if (tp->focus_count == GGML_CPU_FOCUS_CAPACITY) {
+        tp->focus_dropped++;
+        return;
+    }
+    struct ggml_cpu_focus_record * r = &tp->focus[tp->focus_count++];
+    r->sequence = tp->focus_sequence;
+    r->index = index;
+    r->fused = fused;
+    r->nth = nth;
+    r->flags = node->flags;
+    r->start = INT64_MAX;
+    r->end = r->work = 0;
+    for (int j = 0; j < nth; ++j) {
+        r->start = MIN(r->start, tp->workers[j].prof_start[slot]);
+        r->end = MAX(r->end, tp->workers[j].prof_fin[slot]);
+        r->work += tp->workers[j].prof_work[slot];
+    }
+    if (node == tp->focus_mat_node) {
+        for (int j = 0; j < nth; ++j) {
+            if (tp->focus_workers_count == GGML_CPU_FOCUS_WORKERS_CAPACITY) {
+                tp->focus_workers_dropped++;
+                continue;
+            }
+            const struct ggml_compute_state * w = &tp->workers[j];
+            struct ggml_cpu_focus_worker_record * wr = &tp->focus_workers[tp->focus_workers_count++];
+            wr->sequence = tp->focus_sequence;
+            wr->ith = j;
+            wr->start = w->prof_start[slot];
+            wr->end = w->prof_fin[slot];
+            wr->quant = w->focus_phase[0];
+            wr->release = w->focus_phase[1];
+            wr->rows = w->focus_rows;
+            wr->weights = w->focus_weights;
+            wr->input = (uintptr_t) node->src[1]->data;
+            wr->weight_bytes = ggml_nbytes(node->src[0]);
+            wr->observed = w->focus_observed;
+            wr->previous_done = w->focus_previous_done;
+            wr->waited = w->focus_waited;
+        }
+    }
+    r->tail = barrier - r->end;
+    r->tensor = (uintptr_t) node;
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const struct ggml_tensor * src = node->src[j];
+        while (src && src->view_src) src = src->view_src;
+        r->src[j] = (uintptr_t) src;
+    }
+    r->data = node->src[0] ? (uintptr_t) node->src[0]->data : 0;
+    memcpy(r->ne, node->ne, sizeof(r->ne));
+    memset(r->src_ne, 0, sizeof(r->src_ne));
+    if (node->src[0]) memcpy(r->src_ne, node->src[0]->ne, sizeof(r->src_ne));
+    snprintf(r->name, sizeof(r->name), "%s", node->name);
+    snprintf(r->weight, sizeof(r->weight), "%s", node->src[0] ? node->src[0]->name : "");
+    snprintf(r->op, sizeof(r->op), "%s", ggml_op_desc(node));
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3341,7 +4401,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
 #else
-    set_numa_thread_affinity(state->ith);
+    set_numa_thread_affinity(state->ith, atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK);
 #endif
 
     struct ggml_compute_params params = {
@@ -3359,10 +4419,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
-    const bool prof = ggml_cpu_profile;
+    const char * endpoint = cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1]->name : "";
+    const bool focus = tp->focus && (!strcmp(endpoint, "linear_attn_out-0") || !strcmp(endpoint, "ffn_moe_out-0") || !strcmp(endpoint, "linear_attn_out-1"));
+    const bool prof = ggml_cpu_profile || ggml_cpu_trace_graph_enabled(cgraph) || focus;
+    const bool trace_ops = ggml_cpu_trace_graph_enabled(cgraph);
+#ifndef GGML_USE_OPENMP
+    const uint64_t poll_sequence = state->poll_trace && tp->focus_mat_node ? tp->focus_sequence : 0;
+    if (state->poll_trace && !strcmp(endpoint, "ffn_moe_out-0")) {
+        state->poll_trace->enabled = true;
+        ggml_cpu_poll_event(state, 10, state->last_graph, 0, 0, 0);
+    }
+#endif
     int  prof_slot    = 0;
     bool prof_pending = false;
     int64_t prof_t0   = 0;
+    int prof_node_n   = 0;
     bool prof_fused   = false;
     const struct ggml_tensor * prof_node = NULL;
 
@@ -3380,6 +4451,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (prof) {
             prof_t0 = ggml_time_us();
+            state->prof_start[prof_slot] = prof_t0;
+            if (node == tp->focus_mat_node) {
+#ifndef GGML_USE_OPENMP
+                ggml_cpu_poll_event(state, 8, state->last_graph, 0, 0, 0);
+#endif
+                state->focus_phase[0] = state->focus_phase[1] = 0;
+                state->focus_rows = 0;
+                state->focus_weights = 0;
+            }
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
@@ -3396,6 +4476,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             state->prof_work[prof_slot] = fin - prof_t0;
             state->prof_fin[prof_slot]  = fin;
             prof_node    = node;
+            prof_node_n  = node_n;
             prof_fused   = n_fused > 0;
             prof_pending = true;
         }
@@ -3412,7 +4493,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 // the barrier ordered the team's timestamp writes before this
                 // fold; the team starts the next node on the other slot
                 if (state->ith == 0) {
-                    ggml_cpu_profile_fold(tp, prof_node, prof_fused, prof_t0, ggml_time_us(), params.nth, prof_slot);
+                    const int64_t t_bar = ggml_time_us();
+                    if (ggml_cpu_profile) {
+                        ggml_cpu_profile_fold(tp, prof_node, prof_fused, prof_t0, t_bar, params.nth, prof_slot);
+                    }
+                    if (focus) ggml_cpu_focus_fold(tp, prof_node, prof_node_n, prof_fused, params.nth, prof_slot, t_bar);
+                    if (trace_ops) {
+                        ggml_cpu_trace_op_fold(tp, cgraph, prof_node_n, prof_node, prof_fused, t_bar, params.nth, prof_slot);
+                    }
                 }
                 prof_slot ^= 1;
                 prof_pending = false;
@@ -3430,13 +4518,28 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     if (prof && prof_pending && state->ith == 0) {
         // the last node has no in-loop barrier; fold it after the trailing one
-        ggml_cpu_profile_fold(tp, prof_node, prof_fused, prof_t0, ggml_time_us(), params.nth, prof_slot);
+        const int64_t t_bar = ggml_time_us();
+        if (ggml_cpu_profile) {
+            ggml_cpu_profile_fold(tp, prof_node, prof_fused, prof_t0, t_bar, params.nth, prof_slot);
+        }
+        if (focus) ggml_cpu_focus_fold(tp, prof_node, prof_node_n, prof_fused, params.nth, prof_slot, t_bar);
+        if (trace_ops) {
+            ggml_cpu_trace_op_fold(tp, cgraph, prof_node_n, prof_node, prof_fused, t_bar, params.nth, prof_slot);
+        }
     }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
 #endif
 
+    if (tp->focus) state->focus_done = ggml_time_us();
+#ifndef GGML_USE_OPENMP
+    ggml_cpu_poll_event(state, 9, state->last_graph, 0, 0, 0);
+    if (poll_sequence) {
+        ggml_cpu_poll_save(state, poll_sequence);
+        state->poll_trace->enabled = false;
+    }
+#endif
     return 0;
 }
 
@@ -3444,18 +4547,37 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
 // check if thread is ready to proceed (exit from polling or sleeping)
 // returns true if loops should exit, sets state->pending to indicate new work
-static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * state) {
+static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * state, bool continue_inactive_poll) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
-    if (state->pending || threadpool->stop || threadpool->pause) { return true; }
+    if (state->pending) {
+        if (state->poll_trace) state->poll_trace->reason = 3;
+        return true;
+    }
+    if (threadpool->stop) {
+        if (state->poll_trace) state->poll_trace->reason = 4;
+        return true;
+    }
+    if (threadpool->pause) {
+        if (state->poll_trace) state->poll_trace->reason = 5;
+        return true;
+    }
 
     // check for new graph/work
     int n_graph   = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed);
     int n_threads = n_graph & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_graph != state->last_graph) {
+        if (threadpool->focus) {
+            state->focus_observed = ggml_time_us();
+            state->focus_previous_done = state->focus_done;
+        }
+        if (state->poll_trace) {
+            state->poll_trace->reason = state->ith < n_threads ? 1 : (continue_inactive_poll ? 0 : 2);
+            ggml_cpu_poll_event(state, state->ith < n_threads ? 2 : 3, n_graph, state->last_graph, 0, 0);
+        }
         state->pending    = (state->ith < n_threads);
         state->last_graph = n_graph;
-        return true;
+        return state->pending || !continue_inactive_poll;
     }
 
     return false;
@@ -3479,27 +4601,41 @@ static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * 
     // Perhaps, we can adjust it dynamically based on load and things.
     const uint64_t n_rounds = 1024UL * 128 * threadpool->poll;
 
-    for (uint64_t i=0; !ggml_graph_compute_thread_ready(state) && i < n_rounds; i++) {
+    if (state->poll_trace) {
+        state->poll_trace->site = 1;
+        state->poll_trace->reason = 0;
+        ggml_cpu_poll_event(state, 1, state->last_graph, 0, 0, n_rounds);
+    }
+    uint64_t i = 0;
+    for (; !ggml_graph_compute_thread_ready(state, threadpool->poll_inactive) && i < n_rounds; i++) {
         // No new work. Keep polling.
         ggml_thread_cpu_relax();
     }
 
+    if (state->poll_trace) ggml_cpu_poll_event(state, 4, state->last_graph, state->poll_trace->reason, i, n_rounds);
     return state->pending;
 }
 
 static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state * state) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
+    if (threadpool->focus) state->focus_waited = false;
     if (ggml_graph_compute_poll_for_work(state)) {
         ggml_graph_compute_thread_sync(state);
         return state->pending;
     }
 
     ggml_mutex_lock_shared(&threadpool->mutex);
-    while (!ggml_graph_compute_thread_ready(state)) {
+    if (state->poll_trace) state->poll_trace->site = 2;
+    ggml_cpu_poll_event(state, 5, state->last_graph, 0, 0, 0);
+    while (!ggml_graph_compute_thread_ready(state, false)) {
         // No new work. Wait for the signal.
         GGML_PRINT_DEBUG("thread #%d waiting for work (sleeping)\n", state->ith);
+        if (threadpool->focus) state->focus_waited = true;
+        ggml_cpu_poll_event(state, 6, state->last_graph, 0, 0, 0);
         ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
+        ggml_cpu_poll_event(state, 7, state->last_graph, 0, 0, 0);
+        ggml_cpu_poll_event(state, 5, state->last_graph, 0, 0, 0);
     }
     ggml_mutex_unlock_shared(&threadpool->mutex);
 
@@ -3558,7 +4694,23 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 
     // Indicate the graph is ready to be processed
     // We need the full seq-cst fence here because of the polling threads (used in thread_sync)
+    struct ggml_cpu_poll_publication * publication = NULL;
+    if (threadpool->poll_publications) {
+        if (threadpool->poll_count < GGML_CPU_POLL_CAPACITY) {
+            publication = &threadpool->poll_publications[threadpool->poll_count++];
+            publication->sequence = threadpool->focus_sequence;
+            publication->graph = n_graph;
+            publication->nth = n_threads;
+            const struct ggml_cgraph * graph = threadpool->cgraph;
+            snprintf(publication->first, sizeof(publication->first), "%s", graph->n_nodes ? graph->nodes[0]->name : "");
+            snprintf(publication->last, sizeof(publication->last), "%s", graph->n_nodes ? graph->nodes[graph->n_nodes - 1]->name : "");
+            publication->before = ggml_time_us();
+        } else {
+            threadpool->poll_dropped++;
+        }
+    }
     atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
+    if (publication) publication->after = ggml_time_us();
 
     if (threadpool->pause) {
        // Update main thread prio and affinity to match the threadpool settings
@@ -3581,7 +4733,8 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool_params * tpp,
                struct ggml_cgraph * cgraph,
-                struct ggml_cplan * cplan) {
+                struct ggml_cplan * cplan,
+                            bool   poll_inactive) {
 
     struct ggml_threadpool * threadpool =
         ggml_aligned_malloc(sizeof(struct ggml_threadpool));
@@ -3598,8 +4751,40 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->workers          = NULL;
         threadpool->n_threads        = tpp->n_threads;
         threadpool->poll             = tpp->poll;
+#if defined(__linux__) && !defined(GGML_USE_OPENMP)
+        threadpool->poll_inactive    = poll_inactive && tpp->poll > 0 && tpp->n_threads > 1;
+#else
+        threadpool->poll_inactive    = false;
+        UNUSED(poll_inactive);
+#endif
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->poll_publications = NULL;
+        threadpool->poll_count = threadpool->poll_dropped = 0;
+        threadpool->focus = NULL;
+        threadpool->focus_count = threadpool->focus_dropped = 0;
+        threadpool->focus_sequence = 0;
+        threadpool->focus_rank = -1;
+        threadpool->focus_mat_node = NULL;
+        threadpool->focus_workers = NULL;
+        threadpool->focus_workers_count = threadpool->focus_workers_dropped = 0;
+        const char * poll_trace = getenv("GGML_CPU_FOCUS_POLL");
+        const char * focus = getenv("GGML_CPU_FOCUS");
+        if (poll_trace && atoi(poll_trace) != 0) {
+            GGML_ASSERT(focus && focus[0]);
+            threadpool->poll_publications = calloc(GGML_CPU_POLL_CAPACITY, sizeof(struct ggml_cpu_poll_publication));
+            GGML_ASSERT(threadpool->poll_publications != NULL);
+            memset(threadpool->poll_publications, 1, GGML_CPU_POLL_CAPACITY * sizeof(struct ggml_cpu_poll_publication));
+        }
+        if (focus && focus[0]) {
+            threadpool->focus = calloc(GGML_CPU_FOCUS_CAPACITY, sizeof(struct ggml_cpu_focus_record));
+            GGML_ASSERT(threadpool->focus != NULL);
+            threadpool->focus_workers = calloc(GGML_CPU_FOCUS_WORKERS_CAPACITY, sizeof(struct ggml_cpu_focus_worker_record));
+            GGML_ASSERT(threadpool->focus_workers != NULL);
+            memset(threadpool->focus_workers, 1, GGML_CPU_FOCUS_WORKERS_CAPACITY * sizeof(struct ggml_cpu_focus_worker_record));
+            // Fault diagnostic storage before measured graph execution.
+            memset(threadpool->focus, 1, GGML_CPU_FOCUS_CAPACITY * sizeof(struct ggml_cpu_focus_record));
+        }
     }
 
     // Allocate and init workers state
@@ -3610,6 +4795,16 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     for (int j = 0; j < tpp->n_threads; j++) {
         workers[j].threadpool = threadpool;
         workers[j].ith        = j;
+#ifndef GGML_USE_OPENMP
+        if (j > 0 && threadpool->poll_publications) {
+            workers[j].poll_trace = ggml_aligned_malloc(sizeof(struct ggml_cpu_poll_worker));
+            GGML_ASSERT(workers[j].poll_trace != NULL);
+            memset(workers[j].poll_trace, 0, sizeof(struct ggml_cpu_poll_worker));
+            workers[j].poll_trace->saved = calloc(GGML_CPU_POLL_CAPACITY, sizeof(struct ggml_cpu_poll_snapshot));
+            GGML_ASSERT(workers[j].poll_trace->saved != NULL);
+            memset(workers[j].poll_trace->saved, 1, GGML_CPU_POLL_CAPACITY * sizeof(struct ggml_cpu_poll_snapshot));
+        }
+#endif
     }
 
     threadpool->workers = workers;
@@ -3652,7 +4847,11 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 }
 
 struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
-    return ggml_threadpool_new_impl(tpp, NULL, NULL);
+    return ggml_threadpool_new_impl(tpp, NULL, NULL, false);
+}
+
+struct ggml_threadpool * ggml_threadpool_new_numa(struct ggml_threadpool_params * tpp, bool poll_inactive) {
+    return ggml_threadpool_new_impl(tpp, NULL, NULL, poll_inactive);
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
@@ -3672,7 +4871,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
-        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan, false);
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
@@ -3683,6 +4882,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    threadpool->focus_mat_node = NULL;
+    if (threadpool->focus && cgraph->n_nodes && !strcmp(cgraph->nodes[cgraph->n_nodes - 1]->name, "linear_attn_out-1")) {
+        threadpool->focus_mat_node = cgraph->nodes[0];
+    }
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3691,6 +4895,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             {
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
+                ggml_numa_barrier_setup(n_threads);
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
             }
 
@@ -3713,8 +4918,15 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads;
     }
 
+    ggml_numa_barrier_setup(n_threads);
+
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
+    if (threadpool->focus) {
+        threadpool->workers[0].focus_observed = ggml_time_us();
+        threadpool->workers[0].focus_previous_done = threadpool->workers[0].focus_done;
+        threadpool->workers[0].focus_waited = false;
+    }
 
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
@@ -4205,6 +5417,31 @@ void ggml_cpu_init(void) {
                     ggml_cpu_profile_path = env;
                 }
                 atexit(ggml_cpu_profile_dump);
+            }
+        }
+
+        {
+            const char * env = getenv("GGML_CPU_TRACE_OPS");
+            if (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) {
+                ggml_cpu_trace_ops = true;
+                ggml_cpu_trace_ops_path = env;
+                ggml_cpu_trace_ops_boundary_filter = getenv("GGML_CPU_TRACE_OPS_BOUNDARY_FILTER");
+                if (strcmp(env, "1") == 0 || strcmp(env, "stderr") == 0) {
+                    ggml_cpu_trace_ops_file = stderr;
+                } else {
+                    ggml_cpu_trace_ops_file = fopen(env, "a");
+                    if (ggml_cpu_trace_ops_file != NULL) {
+                        setvbuf(ggml_cpu_trace_ops_file, NULL, _IOFBF, 16*1024*1024);
+                    }
+                }
+            }
+        }
+
+        {
+            const char * env = getenv("GGML_CPU_MMID_TRACE");
+            if (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) {
+                ggml_cpu_mmid_trace = true;
+                ggml_cpu_mmid_trace_path = env;
             }
         }
 

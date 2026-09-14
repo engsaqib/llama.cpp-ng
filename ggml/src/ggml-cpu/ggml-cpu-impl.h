@@ -15,6 +15,13 @@
 extern "C" {
 #endif
 
+// Diagnostic context is set by the owning CPU dispatcher before graph execution.
+void ggml_cpu_focus_set(struct ggml_threadpool * pool, uint64_t sequence, int rank);
+
+struct ggml_compute_params;
+bool ggml_cpu_focus_mat_enabled(const struct ggml_compute_params * params, const struct ggml_tensor * op);
+void ggml_cpu_focus_mat_phase(const struct ggml_compute_params * params, int phase, int64_t rows, const void * weights);
+
 struct ggml_compute_params {
     // ith = thread index, nth = number of threads
     int ith, nth;
@@ -528,11 +535,24 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 }
 #endif
 
+struct ggml_threadpool_params;
+struct ggml_threadpool * ggml_threadpool_new_numa(struct ggml_threadpool_params * tpp, bool poll_inactive);
+
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
+
+// NUMA weight mirroring (--numa mirror; env GGML_NUMA_MIRROR_MIN_MB=N tunes the buffer size floor, default 1024)
+// Only large CPU weight buffers feeding MUL_MAT/MUL_MAT_ID are mirrored; KV/cache/runtime buffers are not registered.
+bool         ggml_numa_mirror_enabled(void);
+bool         ggml_backend_cpu_buft_is_mirrorable(struct ggml_backend_buffer_type * buft);
+void         ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base, size_t size);
+void         ggml_numa_mirror_buffer_freed(struct ggml_backend_buffer * buffer);
+const void * ggml_numa_mirror_remap(const void * p);
+const void * ggml_numa_mirror_remap_node(const void * p, int node);
+void         ggml_numa_mirror_scan_graph(const struct ggml_cgraph * cgraph);
 
 #ifdef __cplusplus
 }

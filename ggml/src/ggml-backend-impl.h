@@ -238,6 +238,10 @@ extern "C" {
     // Higher scores are preferred, 0 means the backend is not supported in the current system
     typedef int                (*ggml_backend_score_t)(void);
 
+    // NUMA weight mirror: CPU backend registers a notifier so replicas can be dropped when their owner buffer is freed.
+    typedef void (*ggml_sched_buffer_free_notify_t)(struct ggml_backend_buffer *);
+    GGML_API void ggml_sched_set_buffer_free_notify(ggml_sched_buffer_free_notify_t fn);
+
 #ifdef GGML_BACKEND_DL
 #    ifdef __cplusplus
 #        define GGML_BACKEND_DL_IMPL(reg_fn)                             \
