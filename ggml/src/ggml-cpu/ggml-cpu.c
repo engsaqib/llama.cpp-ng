@@ -3888,7 +3888,8 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_TOP_K:
                     {
-                        cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
+                        // indices, or heap entries of the large-k path in ops.cpp (2 slots each)
+                        cur += 2*sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {

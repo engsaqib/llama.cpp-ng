@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdlib>
 #include <cmath>
 
 // ggml_compute_forward_dup
@@ -8260,12 +8261,70 @@ void ggml_compute_forward_argsort(
 
 // ggml_compute_forward_top_k
 
+#define GGML_TOP_K_HEAP_MIN 64
+
 struct cmp_top_k {
     const float * data;
     bool operator()(int32_t a, int32_t b) const {
         return data[a] > data[b];
     }
 };
+
+// [TAG_TOP_K_HEAP_SELECT] large-k selection without the index indirection of std::partial_sort.
+// It replays libstdc++'s __heap_select step by step (build a min-heap on the first k values, then
+// replace the root on every strictly greater value, sifting the hole down to a leaf and back up),
+// so the selected set is the same as partial_sort's, including which of several tied values at the
+// k-th place get in. Its sort_heap pass is skipped: the result is left in heap order, as the order
+// of the top-k indices is unspecified anyway (see the swap below).
+struct top_k_ent {
+    float   v;
+    int32_t i;
+};
+
+static inline void top_k_heap_adjust(top_k_ent * h, int64_t hole, int64_t len, top_k_ent value) {
+    const int64_t top = hole;
+    int64_t second = hole;
+    const int64_t lim = (len - 1)/2;
+    while (second < lim) {
+        second = 2*(second + 1);
+        second -= (int64_t) (h[second].v > h[second - 1].v);
+        h[hole] = h[second];
+        hole = second;
+    }
+    if ((len & 1) == 0 && second == (len - 2)/2) {
+        second = 2*(second + 1);
+        h[hole] = h[second - 1];
+        hole = second - 1;
+    }
+    int64_t parent = (hole - 1)/2;
+    while (hole > top && h[parent].v > value.v) {
+        h[hole] = h[parent];
+        hole = parent;
+        parent = (hole - 1)/2;
+    }
+    h[hole] = value;
+}
+
+static void top_k_heap_select(const float * x, int64_t n, int64_t k, top_k_ent * h) {
+    for (int64_t j = 0; j < k; j++) {
+        h[j] = { x[j], (int32_t) j };
+    }
+    if (k >= 2) {
+        for (int64_t p = (k - 2)/2; ; p--) {
+            top_k_heap_adjust(h, p, k, h[p]);
+            if (p == 0) {
+                break;
+            }
+        }
+    }
+    float thr = h[0].v;
+    for (int64_t j = k; j < n; j++) {
+        if (x[j] > thr) {
+            top_k_heap_adjust(h, 0, k, top_k_ent{ x[j], (int32_t) j });
+            thr = h[0].v;
+        }
+    }
+}
 
 static void ggml_compute_forward_top_k_f32(
     const ggml_compute_params * params,
@@ -8284,20 +8343,30 @@ static void ggml_compute_forward_top_k_f32(
 
     const int top_k = ne0;
 
-    int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
+    // 2*ne00 int32 slots per thread (see ggml_graph_plan): ne00 indices, or up to ne00 heap entries
+    int32_t * tmp = (int32_t *) params->wdata + (2*ne00 + CACHE_LINE_SIZE_F32) * ith;
+
+    const bool use_heap = GGML_TOP_K_HEAP_MIN > 0 && top_k >= GGML_TOP_K_HEAP_MIN && std::getenv("GGML_TOP_K_NO_HEAP") == nullptr;
 
     for (int64_t i = ith; i < nr; i += nth) {
         const float * src_data = (float *)((char *) src0->data + i*nb01);
-
-        for (int64_t j = 0; j < ne00; j++) {
-            tmp[j] = j;
-        }
-
-        std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data});
-
         int32_t * dst_data = (int32_t *)((char *) dst->data + i*nb1);
 
-        std::copy(tmp, tmp + top_k, dst_data);
+        if (use_heap) {
+            top_k_ent * h = (top_k_ent *) tmp;
+            top_k_heap_select(src_data, ne00, top_k, h);
+            for (int64_t j = 0; j < top_k; j++) {
+                dst_data[j] = h[j].i;
+            }
+        } else {
+            for (int64_t j = 0; j < ne00; j++) {
+                tmp[j] = j;
+            }
+
+            std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data});
+
+            std::copy(tmp, tmp + top_k, dst_data);
+        }
 
         // emphasize that the order is not important
         if (top_k > 1) {
