@@ -288,13 +288,32 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model) {
     int32_t n_set = 0;
 
-    if (cpuparams.n_threads < 0) {
-        // Assuming everything about cpuparams is invalid
-        if (role_model != nullptr) {
-            cpuparams = *role_model;
-        } else {
-            cpuparams.n_threads = common_cpu_get_num_math();
+    if (role_model != nullptr) {
+        // inherit per field, not wholesale: a role model is only the default for the fields this
+        // role did not set. copying the whole struct whenever n_threads is unset threw away every
+        // other option the user gave, so e.g. "--poll-draft 1" without "--threads-draft" was parsed
+        // and then silently overwritten with the main poll level
+        if (cpuparams.n_threads < 0) {
+            cpuparams.n_threads = role_model->n_threads;
         }
+        if (!cpuparams.mask_valid && role_model->mask_valid) {
+            cpuparams.mask_valid = true;
+            std::memcpy(cpuparams.cpumask, role_model->cpumask, sizeof(cpuparams.cpumask));
+        }
+        if (!cpuparams.priority_set && role_model->priority_set) {
+            cpuparams.priority     = role_model->priority;
+            cpuparams.priority_set = true;
+        }
+        if (!cpuparams.strict_cpu_set && role_model->strict_cpu_set) {
+            cpuparams.strict_cpu     = role_model->strict_cpu;
+            cpuparams.strict_cpu_set = true;
+        }
+        if (!cpuparams.poll_set && role_model->poll_set) {
+            cpuparams.poll     = role_model->poll;
+            cpuparams.poll_set = true;
+        }
+    } else if (cpuparams.n_threads < 0) {
+        cpuparams.n_threads = common_cpu_get_num_math();
     }
 
     for (int32_t i = 0; i < GGML_MAX_N_THREADS; i++) {

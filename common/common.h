@@ -72,6 +72,13 @@ struct common_cpu_params {
     enum ggml_sched_priority  priority   = GGML_SCHED_PRIO_NORMAL;  // Scheduling prio : (0 - normal, 1 - medium, 2 - high, 3 - realtime)
     bool     strict_cpu                  = false;   // Use strict CPU placement
     uint32_t poll                        = 50;      // Polling (busywait) level (0 - no polling, 100 - mostly polling)
+
+    // set by the argument parser when the corresponding option is given explicitly. the roles that
+    // document a field as "same as <main option>" (batch, draft, draft batch) inherit it from their
+    // role model, and the value alone cannot tell an untouched field from one set to the default
+    bool     priority_set                = false;
+    bool     strict_cpu_set              = false;
+    bool     poll_set                    = false;
 };
 
 int32_t common_cpu_get_num_physical_cores();

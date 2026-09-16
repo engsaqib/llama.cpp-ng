@@ -261,6 +261,43 @@ static void test(void) {
         assert(synth_params.speculative.synth_len == 3.4);
     }
 
+    // the batch and draft roles inherit each threadpool field they were not given, and keep the ones
+    // they were. inheriting the whole struct instead used to discard an explicit --poll-draft unless
+    // --threads-draft happened to be passed along with it
+    {
+        common_params cpu_params;
+        argv = {"binary_name", "--poll", "7"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_SERVER));
+        assert(cpu_params.cpuparams.poll                   == 7);
+        assert(cpu_params.cpuparams_batch.poll             == 7);
+        assert(cpu_params.speculative.draft.cpuparams.poll == 7);
+        assert(common_base_params_to_speculative(cpu_params).cpuparams.poll == 7);
+    }
+
+    {
+        common_params cpu_params;
+        argv = {"binary_name", "--poll", "7", "--poll-draft", "1", "--poll-batch", "2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_SERVER));
+        assert(cpu_params.cpuparams.poll                         == 7);
+        assert(cpu_params.cpuparams_batch.poll                   == 2);
+        assert(cpu_params.speculative.draft.cpuparams.poll       == 1);
+        assert(cpu_params.speculative.draft.cpuparams_batch.poll == 2); // from --poll-batch
+        assert(common_base_params_to_speculative(cpu_params).cpuparams.poll == 1);
+    }
+
+    {
+        // an explicit thread count no longer suppresses inheritance of the other fields
+        common_params cpu_params;
+        argv = {"binary_name", "--poll", "7", "--spec-draft-threads", "3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_SERVER));
+        assert(cpu_params.speculative.draft.cpuparams.n_threads == 3);
+        assert(cpu_params.speculative.draft.cpuparams.poll      == 7);
+
+        const auto draft = common_base_params_to_speculative(cpu_params);
+        assert(draft.cpuparams.n_threads == 3);
+        assert(draft.cpuparams.poll      == 7);
+    }
+
     {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-rates", "0.8,0.6,0.2"};

@@ -2513,11 +2513,19 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+    }
 
-        if (params_spec.cpuparams.n_threads > 0) {
-            result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
-            result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
-        }
+    // thread and threadpool options for the draft context. postprocess_cpu_params has already filled
+    // in every field the user did not set for the draft role from the main context's value, so this
+    // is a complete set and can be taken wholesale; copying only n_threads dropped --poll-draft,
+    // --prio-draft, --cpu-strict-draft and --cpu-mask-draft on the floor. the guard is for params
+    // that were built programmatically and never went through the argument parser.
+    // note: this applies to MTP as well, which has no draft model but does get its own context
+    if (params_spec.cpuparams.n_threads > 0) {
+        result.cpuparams = params_spec.cpuparams;
+    }
+    if (params_spec.cpuparams_batch.n_threads > 0) {
+        result.cpuparams_batch = params_spec.cpuparams_batch;
     }
 
     result.cache_type_k  = params_spec.cache_type_k;
@@ -2550,6 +2558,8 @@ struct common_speculative_init_result::impl {
     ~impl() = default;
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
+    common_threadpools threadpools;
+
     llama_model_ptr   model;
     llama_context_ptr context;
 };
@@ -2599,6 +2609,11 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+
+        // the draft context is built here rather than through common_init_from_params, so it has to
+        // create its own threadpool. without one it falls back to a throwaway pool per graph, whose
+        // parameters are hardcoded defaults - the poll level and affinity asked for are then ignored
+        pimpl->threadpools.init(ctx_dft, params);
     } else if (spec_mtp) {
         model_path = params.model.path;
 
@@ -2611,6 +2626,8 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+
+        pimpl->threadpools.init(ctx_dft, params);
     }
 }
 

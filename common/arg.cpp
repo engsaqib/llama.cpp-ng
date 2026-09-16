@@ -1601,6 +1601,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("use strict CPU placement (default: %u)\n", (unsigned) params.cpuparams.strict_cpu),
         [](common_params & params, const std::string & value) {
             params.cpuparams.strict_cpu = std::stoul(value);
+            params.cpuparams.strict_cpu_set = true;
         }
     ));
     add_opt(common_arg(
@@ -1611,6 +1612,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.cpuparams.priority = (enum ggml_sched_priority) prio;
+            params.cpuparams.priority_set = true;
         }
     ));
     add_opt(common_arg(
@@ -1618,6 +1620,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("use polling level to wait for work (0 - no polling, default: %u)\n", (unsigned) params.cpuparams.poll),
         [](common_params & params, const std::string & value) {
             params.cpuparams.poll = std::stoul(value);
+            params.cpuparams.poll_set = true;
         }
     ));
     add_opt(common_arg(
@@ -1645,6 +1648,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "use strict CPU placement (default: same as --cpu-strict)",
         [](common_params & params, int value) {
             params.cpuparams_batch.strict_cpu = value;
+            params.cpuparams_batch.strict_cpu_set = true;
         }
     ));
     add_opt(common_arg(
@@ -1655,6 +1659,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.cpuparams_batch.priority = (enum ggml_sched_priority) prio;
+            params.cpuparams_batch.priority_set = true;
         }
     ));
     add_opt(common_arg(
@@ -1662,6 +1667,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "use polling to wait for work (default: same as --poll)",
         [](common_params & params, int value) {
             params.cpuparams_batch.poll = value;
+            params.cpuparams_batch.poll_set = true;
         }
     ));
     add_opt(common_arg(
@@ -4078,6 +4084,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "Use strict CPU placement for draft model (default: same as --cpu-strict)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams.strict_cpu = value;
+            params.speculative.draft.cpuparams.strict_cpu_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -4088,6 +4095,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.speculative.draft.cpuparams.priority = (enum ggml_sched_priority) prio;
+            params.speculative.draft.cpuparams.priority_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -4095,6 +4103,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "Use polling to wait for draft model work (default: same as --poll)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams.poll = value;
+            params.speculative.draft.cpuparams.poll_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -4122,6 +4131,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "Use strict CPU placement for draft model (default: --cpu-strict-draft)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams_batch.strict_cpu = value;
+            params.speculative.draft.cpuparams_batch.strict_cpu_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -4132,6 +4142,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.speculative.draft.cpuparams_batch.priority = (enum ggml_sched_priority) prio;
+            params.speculative.draft.cpuparams_batch.priority_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -4139,6 +4150,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "Use polling to wait for draft model work (default: --poll-draft)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams_batch.poll = value;
+            params.speculative.draft.cpuparams_batch.poll_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
