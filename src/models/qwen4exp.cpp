@@ -1492,7 +1492,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
             conv_states_all->nb[1],
             kv_head * row_size);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    // no ggml_cont: tail is strided only across rows (nb[0] is still one element),
+    // and dst is contiguous because row_total == state_cols*channels, so the copy
+    // already takes the memcpy-by-rows path and the extra staging buffer is dead work
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
 
     return conv_input;
 }
