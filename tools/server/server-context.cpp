@@ -2742,6 +2742,15 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
+
+    // splits t_decode into the target forward pass and the draft-context catch-up, and covers the
+    // speculative verify sampler that t_sampl does not reach
+    int64_t t_tgt_decode  = 0;
+    int64_t t_spec_proc   = 0;
+    int64_t t_sampl_spec  = 0;
+    int64_t n_tgt_decode  = 0;
+    int64_t n_spec_proc   = 0;
+    int64_t n_sampl_spec  = 0;
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
@@ -2774,6 +2783,25 @@ private:
             SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
             SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+
+            const auto avg = [](int64_t t, int64_t n) { return n > 0 ? (double) t / n / 1000.0 : 0.0; };
+
+            SRV_INF("avg t_tgt_decode  = %f ms (n = %" PRId64 ")\n", avg(t_tgt_decode, n_tgt_decode), n_tgt_decode);
+            SRV_INF("avg t_spec_proc   = %f ms (n = %" PRId64 ")\n", avg(t_spec_proc,  n_spec_proc),  n_spec_proc);
+            SRV_INF("avg t_sampl_spec  = %f ms (n = %" PRId64 ")\n", avg(t_sampl_spec, n_sampl_spec), n_sampl_spec);
+
+            // the draft forward pass is charged to ctx_dft, so read it from there rather than re-timing it
+            const auto perf_tgt = llama_perf_context(ctx_tgt);
+
+            SRV_INF("tgt  eval = %10.2f ms / %6d tokens, p_eval = %10.2f ms / %6d tokens\n",
+                    perf_tgt.t_eval_ms, perf_tgt.n_eval, perf_tgt.t_p_eval_ms, perf_tgt.n_p_eval);
+
+            if (ctx_dft) {
+                const auto perf_dft = llama_perf_context(ctx_dft);
+
+                SRV_INF("dft  eval = %10.2f ms / %6d tokens, p_eval = %10.2f ms / %6d tokens\n",
+                        perf_dft.t_eval_ms, perf_dft.n_eval, perf_dft.t_p_eval_ms, perf_dft.n_p_eval);
+            }
         }
 #endif
 
@@ -3651,12 +3679,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
-            }
-        });
+        {
+            scoped_timer t(t_tgt_decode, n_tgt_decode);
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_decode(ctx_tgt, batch_view);
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+        }
 
         if (ret != 0) {
             {
@@ -3716,8 +3747,12 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            scoped_timer t(t_spec_proc, n_spec_proc);
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
+#ifdef DEBUG_TIMINGS
+                llama_synchronize(ctx_dft);
+#endif
             });
 
             if (!ok) {
@@ -3885,11 +3920,15 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
-                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                std::vector<llama_token> accepted;
+                {
+                    scoped_timer timer(t_sampl_spec, n_sampl_spec);
+                    accepted = synth_probs.empty()
+                        ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                        : server_sample_and_accept_synth(
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                                synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
