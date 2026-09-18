@@ -253,6 +253,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // env: LLAMA_GRAPH_REBUILD_PROFILE - no-op unless the variable is set
+    void perf_print_graph_rebuild() const;
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -394,4 +397,27 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // env: LLAMA_GRAPH_REBUILD_PROFILE
+    // a graph rebuild is charged whenever can_reuse() fails, which happens on every change of
+    // ubatch shape. these split that cost into its three phases so it is clear which one pays.
+    mutable int32_t n_rebuild          = 0;
+    mutable int32_t n_rebuild_single   = 0; // rebuilds for a single-token ubatch
+    mutable int64_t t_rebuild_reset_us = 0; // ggml_backend_sched_reset
+    mutable int64_t t_rebuild_build_us = 0; // model.build_graph
+    mutable int64_t t_rebuild_alloc_us = 0; // ggml_backend_sched_alloc_graph
+
+    // ggml_gallocr_needs_realloc re-plans the arena when n_nodes or n_leafs differ, never for a
+    // node that merely got smaller (ggml-alloc.c:1006 keeps a high-water mark). so the question
+    // is whether the graph topology changes with ubatch width, and by how much.
+    // 4 slots joining and leaving produce many more distinct widths than a single slot does
+    static constexpr int32_t REBUILD_SHAPES_MAX = 32;
+
+    mutable int32_t n_rebuild_topo    = 0; // rebuilds whose node count differed from the last one
+    mutable int32_t gf_n_nodes_prev   = -1;
+    mutable int32_t n_rebuild_shapes  = 0;
+    mutable int32_t n_rebuild_shapes_dropped = 0;
+    mutable int32_t rebuild_shape_n_tokens[REBUILD_SHAPES_MAX] = {0};
+    mutable int32_t rebuild_shape_n_nodes [REBUILD_SHAPES_MAX] = {0};
+    mutable int32_t rebuild_shape_count   [REBUILD_SHAPES_MAX] = {0};
 };

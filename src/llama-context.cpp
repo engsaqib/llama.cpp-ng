@@ -1356,16 +1356,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        const int64_t t_reset_us = ggml_time_us();
+
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const int64_t t_build_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        const int64_t t_alloc_us = ggml_time_us();
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1377,6 +1379,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // a rebuild is the price of an ubatch shape change - see n_rebuild in llama-context.h
+        n_rebuild++;
+        n_rebuild_single   += ubatch.n_tokens == 1 ? 1 : 0;
+        t_rebuild_reset_us += t_build_us - t_reset_us;
+        t_rebuild_build_us += t_alloc_us - t_build_us;
+        t_rebuild_alloc_us += ggml_time_us() - t_alloc_us;
+
+        const int32_t gf_n_nodes = ggml_graph_n_nodes(gf);
+
+        n_rebuild_topo += gf_n_nodes_prev >= 0 && gf_n_nodes != gf_n_nodes_prev ? 1 : 0;
+        gf_n_nodes_prev = gf_n_nodes;
+
+        int32_t s = 0;
+        while (s < n_rebuild_shapes &&
+               (rebuild_shape_n_tokens[s] != (int32_t) ubatch.n_tokens ||
+                rebuild_shape_n_nodes [s] != gf_n_nodes)) {
+            s++;
+        }
+        if (s == n_rebuild_shapes && n_rebuild_shapes < REBUILD_SHAPES_MAX) {
+            rebuild_shape_n_tokens[s] = ubatch.n_tokens;
+            rebuild_shape_n_nodes [s] = gf_n_nodes;
+            n_rebuild_shapes++;
+        }
+        if (s < REBUILD_SHAPES_MAX) {
+            rebuild_shape_count[s]++;
+        } else {
+            n_rebuild_shapes_dropped++;
         }
     }
 
@@ -3268,6 +3299,39 @@ llama_perf_context_data llama_context::perf_get_data() const {
     return data;
 }
 
+void llama_context::perf_print_graph_rebuild() const {
+    if (!getenv("LLAMA_GRAPH_REBUILD_PROFILE") || n_rebuild == 0) {
+        return;
+    }
+
+    const double t_total_ms = 1e-3 * (t_rebuild_reset_us + t_rebuild_build_us + t_rebuild_alloc_us);
+
+    // the server installs a log callback that drops LLAMA_LOG_INFO, so write straight to stderr
+    fprintf(stderr, "%s: graph rebuilds = %6d (%d single-token), total %8.2f ms, %7.2f ms each\n",
+            __func__, n_rebuild, n_rebuild_single, t_total_ms, t_total_ms / n_rebuild);
+    fprintf(stderr, "%s:   sched_reset  = %8.2f ms (%7.2f ms each)\n",
+            __func__, 1e-3 * t_rebuild_reset_us, 1e-3 * t_rebuild_reset_us / n_rebuild);
+    fprintf(stderr, "%s:   build_graph  = %8.2f ms (%7.2f ms each)\n",
+            __func__, 1e-3 * t_rebuild_build_us, 1e-3 * t_rebuild_build_us / n_rebuild);
+    fprintf(stderr, "%s:   alloc_graph  = %8.2f ms (%7.2f ms each)\n",
+            __func__, 1e-3 * t_rebuild_alloc_us, 1e-3 * t_rebuild_alloc_us / n_rebuild);
+
+    fprintf(stderr, "%s:   node count changed on %d of %d rebuilds\n",
+            __func__, n_rebuild_topo, n_rebuild);
+
+    for (int32_t s = 0; s < n_rebuild_shapes; s++) {
+        fprintf(stderr, "%s:   shape n_tokens = %5d -> n_nodes = %6d (%d rebuilds)\n",
+                __func__, rebuild_shape_n_tokens[s], rebuild_shape_n_nodes[s], rebuild_shape_count[s]);
+    }
+
+    if (n_rebuild_shapes_dropped > 0) {
+        fprintf(stderr, "%s:   %d rebuilds past the %d-shape table are NOT listed above\n",
+                __func__, n_rebuild_shapes_dropped, REBUILD_SHAPES_MAX);
+    }
+
+    fflush(stderr);
+}
+
 void llama_context::perf_reset() {
     t_start_us  = ggml_time_us();
     t_eval_us   = n_eval = 0;
@@ -4166,6 +4230,10 @@ llama_perf_context_data llama_perf_context(const llama_context * ctx) {
     }
 
     data = ctx->perf_get_data();
+
+    // the server reports its own timings and never calls llama_perf_context_print, so hang the
+    // rebuild profile off the accessor it does call. env-gated, so default output is unchanged.
+    ctx->perf_print_graph_rebuild();
 
     return data;
 }
