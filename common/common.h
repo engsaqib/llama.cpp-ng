@@ -400,12 +400,29 @@ struct common_params_speculative {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
+    // rollback depth the recurrent cache must keep, over every speculator that is enabled.
+    // each family carries its draft length in its own field, so the max is taken per type
+    // rather than read once from draft.n_max.
     uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
+        uint32_t n_rs_seq = 0;
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        for (auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                    n_rs_seq = std::max(n_rs_seq, (uint32_t) draft.n_max);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                    n_rs_seq = std::max(n_rs_seq, (uint32_t) ngram_mod.n_max);
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        return n_rs_seq;
     }
 };
 
