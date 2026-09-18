@@ -919,11 +919,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         ret.axis = ggml_backend_meta_split_axis(dim);
                         const int64_t src_lower = tensor->src[0]->nb[axis+1] / tensor->src[0]->nb[axis];
                         const int64_t dst_lower = tensor->nb[dim+1] / tensor->nb[dim];
+                        // a segment of n elements along the src axis spans n*nb_src[axis] bytes,
+                        // which is n*dst_lower/src_lower elements along dim in the dst layout
                         for (size_t s = 0; s < ret.n_segments; s++) {
                             for (size_t j = 0; j < n_bufs; j++) {
-                                const int64_t ne_scaled = ret.ne[s*n_bufs + j] * src_lower;
-                                GGML_ASSERT(ne_scaled % dst_lower == 0);
-                                ret.ne[s*n_bufs + j] = ne_scaled / dst_lower;
+                                const int64_t ne_scaled = ret.ne[s*n_bufs + j] * dst_lower;
+                                GGML_ASSERT(ne_scaled % src_lower == 0);
+                                ret.ne[s*n_bufs + j] = ne_scaled / src_lower;
                             }
                         }
                         return ret;
