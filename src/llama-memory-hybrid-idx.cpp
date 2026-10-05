@@ -687,5 +687,13 @@ uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_uba
     const int64_t n_end = (int64_t) (q_max + 1)/ratio;
     const int64_t w     = std::min(mem->pooled_valid(seq), n_end);
 
-    return (uint32_t) std::max<int64_t>(1, n_end - w);
+    // pad to a bound that depends only on the ubatch width: an n_tokens ubatch completes at most
+    // ceil(n_tokens/ratio) blocks past an up-to-date watermark, plus one for a block left
+    // incomplete last time. the exact count alternates (1, 2, 1, ...) once n_tokens > ratio, which
+    // broke graph reuse for every 5+ token MTP verify; set_input_qsa sends spare rows to the dustbin.
+    // up to ratio tokens the exact count is already stable at 1, so keep it there and leave single
+    // token decode on exactly the graph it had before
+    const int64_t n_pad = ubatch.n_tokens <= ratio ? 1 : (int64_t) (ubatch.n_tokens + ratio - 1)/ratio + 1;
+
+    return (uint32_t) std::max<int64_t>(n_pad, n_end - w);
 }
