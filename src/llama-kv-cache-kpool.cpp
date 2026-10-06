@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cells.h"
+#include "llama-memory-hybrid.h"
 
 #include <algorithm>
 #include <cmath>
@@ -490,4 +491,50 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
     if (rebuild) {
         mctx_attn->get_kv()->clear_kpool_dirty();
     }
+}
+
+// mirrors the shapes build_inp_kpool derives; scoring itself is gated on n_ctx, so it is fixed
+bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+
+    mctx_attn = mctx_hyb->get_attn();
+    mctx_idx  = mctx_hyb->get_idx();
+
+    if (mctx_idx == nullptr) {
+        return false;
+    }
+
+    const auto & ubatch = params.ubatch;
+
+    bool res = true;
+
+    res &= k_idxs->ne[0] == ubatch.n_tokens;
+
+    if (pool_cells == nullptr) {
+        return res;
+    }
+
+    const int64_t n_kv     = mctx_attn->get_n_kv();
+    const int64_t n_stream = params.cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    const int64_t n_tps    = ubatch.n_tokens/n_stream;
+    const int64_t n_ps     = (int64_t) ubatch.n_seqs_unq/n_stream;
+    const int64_t n_pools  = llama_kpool_n_pools(n_kv, kpool, n_ps);
+
+    res &= pool_cells->ne[0] == kpool*n_pools && pool_cells->ne[1] == n_stream;
+    res &= pool_bias->ne[0]  == n_pools && pool_bias->ne[1] == n_tps && pool_bias->ne[2] == n_stream;
+    res &= sel_mask->ne[0]   == n_kv && sel_mask->ne[1] == n_tps && sel_mask->ne[3] == n_stream;
+    res &= pool_reps->ne[0]  == n_pools && pool_reps->ne[1] == n_stream;
+
+    // the indexer cache shares the attention cache's slot layout; its key views span its own n_kv
+    res &= (int64_t) mctx_idx->get_n_kv() == n_kv;
+
+    // n_new_max is fixed at build time and a pending re-emit needs the full-width variant
+    const bool    dirty = mctx_attn->get_kv()->get_kpool_dirty();
+    const int64_t n_new = dirty ? n_pools : n_tps/kpool + n_ps;
+
+    res &= rebuild == dirty;
+    res &= (int64_t) n_new_max == n_new;
+    res &= new_pool_cells->ne[0] == kpool*n_new && new_pool_cells->ne[1] == n_stream;
+
+    return res;
 }
