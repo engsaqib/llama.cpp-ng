@@ -2271,6 +2271,12 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+static int mmid_priv = -1;
+static atomic_int ggml_mmid_priv_gen = 0;
+static __thread _Alignas(64) char mmid_priv_buf[32768];
+static __thread const char * mmid_priv_src = NULL;
+static __thread int mmid_priv_gen = -1;
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -2321,6 +2327,18 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                     (src1_cont || src1->type != vec_dot_type
                     ? (i11      + i12*ne11)*row_size
                     : (i11*nb11 + i12*nb12));
+
+                // GGML_MMID_PRIV=1 -> read src1 from a thread-private copy (the quantized row is written in
+                // slices by every thread of the pool and then read whole by each of them)
+                if (mmid_priv && row_size <= sizeof(mmid_priv_buf)) {
+                    const int gen = atomic_load_explicit(&ggml_mmid_priv_gen, memory_order_relaxed);
+                    if (mmid_priv_src != src1_col || mmid_priv_gen != gen) {
+                        memcpy(mmid_priv_buf, src1_col, row_size);
+                        mmid_priv_src = src1_col;
+                        mmid_priv_gen = gen;
+                    }
+                    src1_col = (const char *) mmid_priv_buf;
+                }
 
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
@@ -2430,7 +2448,15 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    if (mmid_priv < 0) {
+        const char * e = getenv("GGML_MMID_PRIV");
+        mmid_priv = e && atoi(e) > 0;
+    }
+
     if (ith == 0) {
+        // new src1 contents: invalidate every thread's private copy (published by the barrier below)
+        atomic_fetch_add_explicit(&ggml_mmid_priv_gen, 1, memory_order_relaxed);
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
