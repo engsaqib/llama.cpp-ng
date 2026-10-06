@@ -2396,6 +2396,38 @@ void ggml_gemv_iq2_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                      GGML_IQ3S_GRID64(pk, 5, f), GGML_IQ3S_GRID64(pk, 4, f), \
                      GGML_IQ3S_GRID64(pk, 3, f), GGML_IQ3S_GRID64(pk, 2, f), \
                      GGML_IQ3S_GRID64(pk, 1, f), GGML_IQ3S_GRID64(pk, 0, f))
+
+// GGML_IQ3S_GATHER=<n > 0>: build the four grid vectors of one sub-block with
+// hardware gathers instead of 64 scalar grid loads. Lane 2r+i of group k reads
+// the index qs[8r + 2k + i] | (qh[r] bit 2k+i) << 8, the same lanes GRID8
+// fills, so the result is bit-identical.
+static bool ggml_iq3s_gather_enabled(void) {
+    static const bool on = [] {
+        const char * v = getenv("GGML_IQ3S_GATHER");
+        return v != nullptr && atoi(v) > 0;
+    }();
+    return on;
+}
+
+#define GGML_IQ3S_GATHER_GROUP(X, H, k) \
+    _mm512_i32gather_epi32(_mm512_or_si512( \
+        _mm512_cvtepu8_epi32(_mm512_cvtepi64_epi16(_mm512_srli_epi64((X), 16 * (k)))), \
+        _mm512_and_si512(_mm512_sllv_epi32((H), _mm512_set_epi32( \
+            7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), \
+            7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k))), \
+            _mm512_set1_epi32(0x100))), \
+        (const void *) iq3s_grid, 4)
+
+static inline void ggml_iq3s_grid_gather(const uint8_t * q0, const uint8_t * qh,
+        __m512i & g0, __m512i & g1, __m512i & g2, __m512i & g3) {
+    const __m512i X  = _mm512_loadu_si512((const void *) q0);
+    const __m128i h8 = _mm_loadl_epi64((const __m128i *) qh);
+    const __m512i H  = _mm512_cvtepu8_epi32(_mm_unpacklo_epi8(h8, h8));
+    g0 = GGML_IQ3S_GATHER_GROUP(X, H, 0);
+    g1 = GGML_IQ3S_GATHER_GROUP(X, H, 1);
+    g2 = GGML_IQ3S_GATHER_GROUP(X, H, 2);
+    g3 = GGML_IQ3S_GATHER_GROUP(X, H, 3);
+}
 #endif
 
 void ggml_gemv_iq3_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -2411,6 +2443,7 @@ void ggml_gemv_iq3_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
         UNUSED(bs);
         UNUSED(nr);
 
+        const bool gather = ggml_iq3s_gather_enabled();
         const __m512i zero      = _mm512_setzero_si512();
         const __m128i m4_128    = _mm_set1_epi8(0xf);
         const __m128i m1_128    = _mm_set1_epi8(1);
@@ -2436,18 +2469,23 @@ void ggml_gemv_iq3_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                     memcpy(&k3, sg + 24, sizeof(k3));
 
                     const uint8_t * q0 = b_ptr[b].qs + sb * 64;
-                    uint64_t pklo[8], pkhi[8];
-                    for (int r = 0; r < 8; r++) {
-                        uint32_t lo, hi;
-                        memcpy(&lo, q0 + r * 8,     sizeof(lo));
-                        memcpy(&hi, q0 + r * 8 + 4, sizeof(hi));
-                        pklo[r] = GGML_IQ3S_PACK_IDX(lo, qh[r] & 0xf);
-                        pkhi[r] = GGML_IQ3S_PACK_IDX(hi, qh[r] >> 4);
+                    __m512i g0, g1, g2, g3;
+                    if (gather) {
+                        ggml_iq3s_grid_gather(q0, qh, g0, g1, g2, g3);
+                    } else {
+                        uint64_t pklo[8], pkhi[8];
+                        for (int r = 0; r < 8; r++) {
+                            uint32_t lo, hi;
+                            memcpy(&lo, q0 + r * 8,     sizeof(lo));
+                            memcpy(&hi, q0 + r * 8 + 4, sizeof(hi));
+                            pklo[r] = GGML_IQ3S_PACK_IDX(lo, qh[r] & 0xf);
+                            pkhi[r] = GGML_IQ3S_PACK_IDX(hi, qh[r] >> 4);
+                        }
+                        g0 = GGML_IQ3S_GRID8(pklo, 0);
+                        g1 = GGML_IQ3S_GRID8(pklo, 2);
+                        g2 = GGML_IQ3S_GRID8(pkhi, 0);
+                        g3 = GGML_IQ3S_GRID8(pkhi, 2);
                     }
-                    const __m512i g0 = GGML_IQ3S_GRID8(pklo, 0);
-                    const __m512i g1 = GGML_IQ3S_GRID8(pklo, 2);
-                    const __m512i g2 = GGML_IQ3S_GRID8(pkhi, 0);
-                    const __m512i g3 = GGML_IQ3S_GRID8(pkhi, 2);
 
                     int64_t a8[4];
                     memcpy(a8, a_ptr[b].qs + sb * 32, sizeof(a8));
@@ -14299,6 +14337,7 @@ void ggml_gemm_iq3_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
         assert(nr % 4 == 0);
         assert(nc % 8 == 0);
 
+        const bool gather = ggml_iq3s_gather_enabled();
         const __m512i zero   = _mm512_setzero_si512();
         const __m128i m4_128 = _mm_set1_epi8(0xf);
         const __m128i m1_128 = _mm_set1_epi8(1);
@@ -14330,18 +14369,23 @@ void ggml_gemm_iq3_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                         memcpy(&k3, sg + 24, sizeof(k3));
 
                         const uint8_t * q0 = b_ptr[b].qs + sb * 64;
-                        uint64_t pklo[8], pkhi[8];
-                        for (int r = 0; r < 8; r++) {
-                            uint32_t lo, hi;
-                            memcpy(&lo, q0 + r * 8,     sizeof(lo));
-                            memcpy(&hi, q0 + r * 8 + 4, sizeof(hi));
-                            pklo[r] = GGML_IQ3S_PACK_IDX(lo, qh[r] & 0xf);
-                            pkhi[r] = GGML_IQ3S_PACK_IDX(hi, qh[r] >> 4);
+                        __m512i g0, g1, g2, g3;
+                        if (gather) {
+                            ggml_iq3s_grid_gather(q0, qh, g0, g1, g2, g3);
+                        } else {
+                            uint64_t pklo[8], pkhi[8];
+                            for (int r = 0; r < 8; r++) {
+                                uint32_t lo, hi;
+                                memcpy(&lo, q0 + r * 8,     sizeof(lo));
+                                memcpy(&hi, q0 + r * 8 + 4, sizeof(hi));
+                                pklo[r] = GGML_IQ3S_PACK_IDX(lo, qh[r] & 0xf);
+                                pkhi[r] = GGML_IQ3S_PACK_IDX(hi, qh[r] >> 4);
+                            }
+                            g0 = GGML_IQ3S_GRID8(pklo, 0);
+                            g1 = GGML_IQ3S_GRID8(pklo, 2);
+                            g2 = GGML_IQ3S_GRID8(pkhi, 0);
+                            g3 = GGML_IQ3S_GRID8(pkhi, 2);
                         }
-                        const __m512i g0 = GGML_IQ3S_GRID8(pklo, 0);
-                        const __m512i g1 = GGML_IQ3S_GRID8(pklo, 2);
-                        const __m512i g2 = GGML_IQ3S_GRID8(pkhi, 0);
-                        const __m512i g3 = GGML_IQ3S_GRID8(pkhi, 2);
 
                         const __m128i sc8 = _mm_loadl_epi64((const __m128i *) (b_ptr[b].scales + (sb / 2) * 8));
                         const __m128i nib = sb % 2 == 0 ? _mm_and_si128(sc8, m4_128)
