@@ -11379,6 +11379,50 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // GGML_HC_POST_FAST=1 -> loop over (token, stream) rows with a contiguous inner loop over n_embd instead
+    // of three 64-bit div/mod per output; same per-element operation order, so the result is unchanged
+    static const bool hc_post_fast = [] { const char * e = std::getenv("GGML_HC_POST_FAST"); return e && atoi(e) > 0; }();
+
+    if (hc_post_fast && nbx0 == sizeof(float) && nbr0 == sizeof(float) && nbd0 == sizeof(float) && hc <= 16) {
+        const int64_t blk  = 64;
+        const int64_t nblk = (n_embd + blk - 1) / blk;
+        const int64_t ni   = nblk * hc * n_tokens;
+        const int64_t di   = (ni + nth - 1) / nth;
+        const int64_t ii0  = di * ith;
+        const int64_t ii1  = MIN(ii0 + di, ni);
+
+        for (int64_t ii = ii0; ii < ii1; ++ii) {
+            const int64_t ib   = ii % nblk;
+            const int64_t idst = (ii / nblk) % hc;
+            const int64_t it   = ii / (nblk * hc);
+            const int64_t j0   = ib * blk;
+            const int64_t j1   = MIN(j0 + blk, n_embd);
+
+            const float   pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+            const float * xr = (const float *) ((const char *) x->data + it*nbx1);
+            float       * dr = (float *) ((char *) dst->data + idst*nbd1 + it*nbd2);
+
+            float         cv[16];
+            const float * rr[16];
+            for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                cv[isrc] = *(const float *) ((const char *) comb->data + idst*nbc0 + isrc*nbc1 + it*nbc2);
+                rr[isrc] = (const float *) ((const char *) residual->data + isrc*nbr1 + it*nbr2);
+            }
+
+            for (int64_t i0 = j0; i0 < j1; ++i0) {
+                dr[i0] = xr[i0] * pv;
+            }
+            for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                const float   c = cv[isrc];
+                const float * r = rr[isrc];
+                for (int64_t i0 = j0; i0 < j1; ++i0) {
+                    dr[i0] += r[i0] * c;
+                }
+            }
+        }
+        return;
+    }
+
     const int64_t nr  = n_embd * hc * n_tokens;
     const int64_t dr  = (nr + nth - 1) / nth;
     const int64_t ir0 = dr * ith;
