@@ -3624,6 +3624,94 @@ static void ggml_compute_forward_rms_norm_f32(
     memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
+    // GGML_RMS_NORM_SPLIT=1 -> with fewer rows than threads (decode, MTP verify) split the rows into 64-float
+    // blocks across all threads instead of one serial sum per row on a few threads. Each block is summed in
+    // order in double and the block sums are added in order, so the result does not depend on the thread count;
+    // it can differ from the single serial sum in the last bit of the double. The scaling pass is unchanged.
+    static const bool rms_split = [] { const char * e = std::getenv("GGML_RMS_NORM_SPLIT"); return e && atoi(e) > 0; }();
+
+    const int64_t bs  = 64;
+    const int64_t nr  = ne01*ne02*ne03;
+    const int64_t nbr = ne00/bs;
+
+    if (rms_split && nr < nth && ne00 >= 1024 && ne00 % bs == 0 && params->wsize >= sizeof(ggml_float)*(size_t)(nr*nbr)) {
+        ggml_float * bsum = (ggml_float *) params->wdata;
+
+        const int64_t nblk = nr*nbr;
+        const int64_t b0   = nblk*ith/nth;
+        const int64_t b1   = nblk*(ith + 1)/nth;
+
+        auto row_x = [&](int64_t r) {
+            return (const float *) ((const char *) src0->data + (r % ne01)*nb01 + ((r/ne01) % ne02)*nb02 + (r/(ne01*ne02))*nb03);
+        };
+
+        // 8 blocks interleaved for ILP, each with its own in-order accumulator
+        int64_t b = b0;
+        for (; b + 8 <= b1; b += 8) {
+            const float * xb[8];
+            ggml_float    s[8] = { 0.0 };
+            for (int k = 0; k < 8; k++) {
+                xb[k] = row_x((b + k)/nbr) + ((b + k) % nbr)*bs;
+            }
+            for (int64_t j = 0; j < bs; j++) {
+                for (int k = 0; k < 8; k++) {
+                    s[k] += (ggml_float)(xb[k][j] * xb[k][j]);
+                }
+            }
+            for (int k = 0; k < 8; k++) {
+                bsum[b + k] = s[k];
+            }
+        }
+        for (; b < b1; b++) {
+            const float * xb = row_x(b/nbr) + (b % nbr)*bs;
+            ggml_float s = 0.0;
+            for (int64_t j = 0; j < bs; j++) {
+                s += (ggml_float)(xb[j] * xb[j]);
+            }
+            bsum[b] = s;
+        }
+
+        ggml_barrier(params->threadpool);
+
+        for (int64_t r = b0/nbr; r < nr && r*nbr < b1; r++) {
+            const int64_t c0 = (std::max(b0, r*nbr)       - r*nbr)*bs;
+            const int64_t c1 = (std::min(b1, (r + 1)*nbr) - r*nbr)*bs;
+
+            ggml_float sum = 0.0;
+            for (int64_t i = 0; i < nbr; i++) {
+                sum += bsum[r*nbr + i];
+            }
+
+            const float mean  = sum/ne00;
+            const float scale = 1.0f/sqrtf(mean + eps);
+
+            assert(scale > 0.0f);
+
+            const int64_t i01 = r % ne01;
+            const int64_t i02 = (r/ne01) % ne02;
+            const int64_t i03 = r/(ne01*ne02);
+
+            const float * x = row_x(r);
+            float       * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+            if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL || FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
+                const float * w = (float *) ((char *) src1->data + (i01 % ne11)*nb11 + (i02 % ne12)*nb12 + (i03 % ne13)*nb13);
+
+                for (int64_t i00 = c0; i00 < c1; i00++) {
+                    y[i00] = x[i00] * scale * w[i00];
+                }
+                if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
+                    const float * a = (float *) ((char *) src2->data + i01*src2->nb[1] + i02*src2->nb[2] + i03*src2->nb[3]);
+                    ggml_vec_add_f32(c1 - c0, y + c0, y + c0, a + c0);
+                }
+            } else {
+                memcpy(y + c0, x + c0, (c1 - c0) * sizeof(float));
+                ggml_vec_scale_f32(c1 - c0, y + c0, scale);
+            }
+        }
+        return;
+    }
+
     // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {

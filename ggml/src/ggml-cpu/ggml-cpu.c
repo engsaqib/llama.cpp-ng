@@ -3964,6 +3964,14 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
+                case GGML_OP_RMS_NORM:
+                    {
+                        // per-block sums for the few-row split (GGML_RMS_NORM_SPLIT) in ggml_compute_forward_rms_norm_f32
+                        const int64_t nr = ggml_nrows(node->src[0]);
+                        if (node->src[0]->ne[0] % 64 == 0 && nr < n_tasks) {
+                            cur = sizeof(ggml_float)*nr*(node->src[0]->ne[0]/64);
+                        }
+                    } break;
                 case GGML_OP_COUNT:
                     {
                         GGML_ABORT("fatal error");
