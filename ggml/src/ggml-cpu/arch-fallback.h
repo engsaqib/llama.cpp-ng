@@ -88,7 +88,9 @@
 #define ggml_gemv_iq2_s_8x8_q8_K_generic ggml_gemv_iq2_s_8x8_q8_K
 #define ggml_gemm_iq2_s_8x8_q8_K_generic ggml_gemm_iq2_s_8x8_q8_K
 #define ggml_gemv_iq3_s_8x8_q8_K_generic ggml_gemv_iq3_s_8x8_q8_K
+#define ggml_gemv_iq3_sn_8x8_q8_K_generic ggml_gemv_iq3_sn_8x8_q8_K
 #define ggml_gemm_iq3_s_8x8_q8_K_generic ggml_gemm_iq3_s_8x8_q8_K
+#define ggml_gemm_iq3_sn_8x8_q8_K_generic ggml_gemm_iq3_sn_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
 #elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
@@ -118,7 +120,9 @@
 #define ggml_gemv_iq2_s_8x8_q8_K_generic ggml_gemv_iq2_s_8x8_q8_K
 #define ggml_gemm_iq2_s_8x8_q8_K_generic ggml_gemm_iq2_s_8x8_q8_K
 #define ggml_gemv_iq3_s_8x8_q8_K_generic ggml_gemv_iq3_s_8x8_q8_K
+#define ggml_gemv_iq3_sn_8x8_q8_K_generic ggml_gemv_iq3_sn_8x8_q8_K
 #define ggml_gemm_iq3_s_8x8_q8_K_generic ggml_gemm_iq3_s_8x8_q8_K
+#define ggml_gemm_iq3_sn_8x8_q8_K_generic ggml_gemm_iq3_sn_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
@@ -209,7 +213,9 @@
 #define ggml_gemv_iq2_s_8x8_q8_K_generic ggml_gemv_iq2_s_8x8_q8_K
 #define ggml_gemm_iq2_s_8x8_q8_K_generic ggml_gemm_iq2_s_8x8_q8_K
 #define ggml_gemv_iq3_s_8x8_q8_K_generic ggml_gemv_iq3_s_8x8_q8_K
+#define ggml_gemv_iq3_sn_8x8_q8_K_generic ggml_gemv_iq3_sn_8x8_q8_K
 #define ggml_gemm_iq3_s_8x8_q8_K_generic ggml_gemm_iq3_s_8x8_q8_K
+#define ggml_gemm_iq3_sn_8x8_q8_K_generic ggml_gemm_iq3_sn_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
 #elif defined(__loongarch64)
@@ -276,7 +282,9 @@
 #define ggml_gemv_iq2_s_8x8_q8_K_generic ggml_gemv_iq2_s_8x8_q8_K
 #define ggml_gemm_iq2_s_8x8_q8_K_generic ggml_gemm_iq2_s_8x8_q8_K
 #define ggml_gemv_iq3_s_8x8_q8_K_generic ggml_gemv_iq3_s_8x8_q8_K
+#define ggml_gemv_iq3_sn_8x8_q8_K_generic ggml_gemv_iq3_sn_8x8_q8_K
 #define ggml_gemm_iq3_s_8x8_q8_K_generic ggml_gemm_iq3_s_8x8_q8_K
+#define ggml_gemm_iq3_sn_8x8_q8_K_generic ggml_gemm_iq3_sn_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
 #elif defined(__riscv)
@@ -336,7 +344,9 @@
 #define ggml_gemv_iq2_s_8x8_q8_K_generic ggml_gemv_iq2_s_8x8_q8_K
 #define ggml_gemm_iq2_s_8x8_q8_K_generic ggml_gemm_iq2_s_8x8_q8_K
 #define ggml_gemv_iq3_s_8x8_q8_K_generic ggml_gemv_iq3_s_8x8_q8_K
+#define ggml_gemv_iq3_sn_8x8_q8_K_generic ggml_gemv_iq3_sn_8x8_q8_K
 #define ggml_gemm_iq3_s_8x8_q8_K_generic ggml_gemm_iq3_s_8x8_q8_K
+#define ggml_gemm_iq3_sn_8x8_q8_K_generic ggml_gemm_iq3_sn_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
 #elif defined(__s390x__)
@@ -409,7 +419,9 @@
 #define ggml_gemv_iq2_s_8x8_q8_K_generic ggml_gemv_iq2_s_8x8_q8_K
 #define ggml_gemm_iq2_s_8x8_q8_K_generic ggml_gemm_iq2_s_8x8_q8_K
 #define ggml_gemv_iq3_s_8x8_q8_K_generic ggml_gemv_iq3_s_8x8_q8_K
+#define ggml_gemv_iq3_sn_8x8_q8_K_generic ggml_gemv_iq3_sn_8x8_q8_K
 #define ggml_gemm_iq3_s_8x8_q8_K_generic ggml_gemm_iq3_s_8x8_q8_K
+#define ggml_gemm_iq3_sn_8x8_q8_K_generic ggml_gemm_iq3_sn_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
 #elif defined(__wasm__)
@@ -483,7 +495,9 @@
 #define ggml_gemv_iq2_s_8x8_q8_K_generic ggml_gemv_iq2_s_8x8_q8_K
 #define ggml_gemm_iq2_s_8x8_q8_K_generic ggml_gemm_iq2_s_8x8_q8_K
 #define ggml_gemv_iq3_s_8x8_q8_K_generic ggml_gemv_iq3_s_8x8_q8_K
+#define ggml_gemv_iq3_sn_8x8_q8_K_generic ggml_gemv_iq3_sn_8x8_q8_K
 #define ggml_gemm_iq3_s_8x8_q8_K_generic ggml_gemm_iq3_s_8x8_q8_K
+#define ggml_gemm_iq3_sn_8x8_q8_K_generic ggml_gemm_iq3_sn_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
 #endif
