@@ -6349,6 +6349,59 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // a permuted src1 is quantized row by row into the plain layout and computed with gemv only.
         const bool src1_rows_cont = nb11 == ggml_row_size(GGML_TYPE_F32, ne10);
 
+        // few src1 rows (decode/verify batches) leave most threads idle while one thread quantizes
+        // a whole long row group: split the quantization by blocks instead (GGML_REPACK_QSPLIT).
+        // every block is quantized on its own, so the result is identical to the row split.
+        // each thread gets at least QMIN_BYTES of output: finer pieces spread the ownership of the
+        // quantized lines over many cores, and the following gemm then reads them measurably
+        // slower than the lines one thread wrote (up to 3-4x on small-K, wide-N products)
+        static const bool qsplit = [] { const char * e = std::getenv("GGML_REPACK_QSPLIT"); return e && atoi(e) > 0; }();
+        const int64_t qblck     = ggml_blck_size(PARAM_TYPE);
+        const int64_t q_groups  = src1_rows_cont ? ne11 / 4 : 0;
+        const int64_t q_singles = ne11 - q_groups * 4;
+        const int64_t q_items   = (q_groups + q_singles) * ne12;
+
+        if (qsplit && q_items < nth && ne10 % qblck == 0) {
+            const size_t  qts  = ggml_type_size(PARAM_TYPE);
+            const int64_t nbq  = ne10 / qblck;
+            const int64_t nblk = q_items * nbq;
+
+            constexpr int64_t QMIN_BYTES = 4096;
+            const int64_t q_bytes = (q_groups * 4 + q_singles) * ne12 * nbq * (int64_t) qts;
+            const int64_t qparts  = std::max<int64_t>(1, std::min<int64_t>(nth, q_bytes / QMIN_BYTES));
+            const int64_t b0      = ith < qparts ? nblk * ith / qparts : 0;
+            const int64_t b1      = ith < qparts ? nblk * (ith + 1) / qparts : 0;
+
+            constexpr int64_t QCH = 1024;  // floats per staged row piece, a multiple of both block sizes
+            float tmp[4 * QCH];
+
+            for (int64_t b = b0; b < b1;) {
+                const int64_t item = b / nbq;
+                const int64_t c0   = b - item * nbq;
+                const int64_t c1   = std::min(nbq, c0 + (b1 - b));
+                const int64_t i12  = item / (q_groups + q_singles);
+                const int64_t j    = item % (q_groups + q_singles);
+
+                const char * data_ptr  = (const char *) src1->data + i12 * nb12;
+                char *       wdata_ptr = wdata + i12 * nbw2;
+
+                if (j < q_groups) {
+                    const int64_t i11 = j * 4;
+                    for (int64_t cc = c0; cc < c1;) {
+                        const int64_t len = std::min(QCH, (c1 - cc) * qblck);
+                        for (int r = 0; r < 4; r++) {
+                            memcpy(tmp + r * len, (const float *) (data_ptr + (i11 + r) * nb11) + cc * qblck, len * sizeof(float));
+                        }
+                        ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(tmp, (void *) (wdata_ptr + i11 * nbw1 + cc * 4 * qts), 4, len);
+                        cc += len / qblck;
+                    }
+                } else {
+                    const int64_t i11 = q_groups * 4 + (j - q_groups);
+                    from_float((const float *) (data_ptr + i11 * nb11) + c0 * qblck, (void *) (wdata_ptr + i11 * nbw1 + c0 * qts), (c1 - c0) * qblck);
+                }
+                b += c1 - c0;
+            }
+        } else
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             char * data_ptr  = (char *) src1->data + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
