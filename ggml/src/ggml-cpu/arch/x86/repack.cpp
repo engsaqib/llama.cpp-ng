@@ -2401,12 +2401,15 @@ void ggml_gemv_iq2_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 // hardware gathers instead of 64 scalar grid loads. Lane 2r+i of group k reads
 // the index qs[8r + 2k + i] | (qh[r] bit 2k+i) << 8, the same lanes GRID8
 // fills, so the result is bit-identical.
-static bool ggml_iq3s_gather_enabled(void) {
-    static const bool on = [] {
+static int ggml_iq3s_gather_mode(void) {
+    static const int mode = [] {
         const char * v = getenv("GGML_IQ3S_GATHER");
-        return v != nullptr && atoi(v) > 0;
+        return v != nullptr && atoi(v) > 0 ? atoi(v) : 0;
     }();
-    return on;
+    return mode;
+}
+static bool ggml_iq3s_gather_enabled(void) {
+    return ggml_iq3s_gather_mode() > 0;
 }
 
 #define GGML_IQ3S_GATHER_GROUP(X, H, k) \
@@ -2418,11 +2421,38 @@ static bool ggml_iq3s_gather_enabled(void) {
             _mm512_set1_epi32(0x100))), \
         (const void *) iq3s_grid, 4)
 
+#if defined(__AVX512BW__)
+// GGML_IQ3S_GATHER=2: the same lanes with cheaper indices. A 128-bit lane of
+// the 64 qs bytes holds rows 2c and 2c+1, which feed dword lanes 4c..4c+3, so
+// one in-lane byte shuffle zero-extends group k's low index bytes; the qh bit
+// is shifted to bit 8 and merged with one ternary op (a | (b & 0x100)).
+#define GGML_IQ3S_SHUF_CTL(k) _mm512_broadcast_i32x4(_mm_set_epi8( \
+        -1, -1, -1, 8 + 2 * (k) + 1, -1, -1, -1, 8 + 2 * (k), \
+        -1, -1, -1,     2 * (k) + 1, -1, -1, -1,     2 * (k)))
+#define GGML_IQ3S_GATHER_GROUP2(X, H, k) \
+    _mm512_i32gather_epi32(_mm512_ternarylogic_epi32( \
+        _mm512_shuffle_epi8((X), GGML_IQ3S_SHUF_CTL(k)), \
+        _mm512_sllv_epi32((H), _mm512_set_epi32( \
+            7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), \
+            7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k), 7 - 2 * (k), 8 - 2 * (k))), \
+        _mm512_set1_epi32(0x100), 0xf8), \
+        (const void *) iq3s_grid, 4)
+#endif
+
 static inline void ggml_iq3s_grid_gather(const uint8_t * q0, const uint8_t * qh,
         __m512i & g0, __m512i & g1, __m512i & g2, __m512i & g3) {
     const __m512i X  = _mm512_loadu_si512((const void *) q0);
     const __m128i h8 = _mm_loadl_epi64((const __m128i *) qh);
     const __m512i H  = _mm512_cvtepu8_epi32(_mm_unpacklo_epi8(h8, h8));
+#if defined(__AVX512BW__)
+    if (ggml_iq3s_gather_mode() >= 2) {
+        g0 = GGML_IQ3S_GATHER_GROUP2(X, H, 0);
+        g1 = GGML_IQ3S_GATHER_GROUP2(X, H, 1);
+        g2 = GGML_IQ3S_GATHER_GROUP2(X, H, 2);
+        g3 = GGML_IQ3S_GATHER_GROUP2(X, H, 3);
+        return;
+    }
+#endif
     g0 = GGML_IQ3S_GATHER_GROUP(X, H, 0);
     g1 = GGML_IQ3S_GATHER_GROUP(X, H, 1);
     g2 = GGML_IQ3S_GATHER_GROUP(X, H, 2);
