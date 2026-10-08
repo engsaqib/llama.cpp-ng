@@ -3214,6 +3214,15 @@ void ggml_gemv_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+#if defined(__AVX512F__)
+// two blocks ahead, as for q6_K; used by the gemv below and the VNNI gemm
+static inline void q5k_prefetch(const block_q5_Kx8 * p) {
+    for (int i = 0; i < (int) sizeof(block_q5_Kx8); i += 64) {
+        _mm_prefetch((const char *) (p + 2) + i, _MM_HINT_T0);
+    }
+}
+#endif
+
 void ggml_gemv_q5_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_K;
     const int nb = n / qk;
@@ -3265,6 +3274,7 @@ void ggml_gemv_q5_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                 __m256 acc_row = _mm256_setzero_ps();
 
                 for (int64_t b = 0; b < nb; b++) {
+                    q5k_prefetch(b_ptr + b);
                     // each 64-byte load holds one 8-byte chunk of 8 interleaved rows
                     __m512i qh[4];
                     for (int g = 0; g < 4; g++) {
@@ -12254,7 +12264,148 @@ void ggml_gemm_q6_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #endif
 }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+// GGML_Q5K_VNNI=<n > 0>: q5_K 8x8 gemm with vpdpbusd on the 5-bit weights as
+// unsigned 0..31 (qs nibble | qh bit << 4). As in the q6_K gemm, one zmm of qs
+// holds 8 bytes of each of the 8 rows and lanes 2r and 2r+1 belong to row r.
+// Sub-block scales and d are applied in float. The mins term dmin * sum(min * bsum)
+// is exact in float (|sum| < 2^24); its lane 2r carries the even sub-blocks and
+// 2r+1 the odd ones, so the final lane-pair add finishes it with the rest.
+static bool ggml_q5k_vnni_enabled(void) {
+    static const bool on = [] {
+        const char * v = getenv("GGML_Q5K_VNNI");
+        return v != nullptr && atoi(v) > 0;
+    }();
+    return on;
+}
+
+// the qh bit at position 4 - sh, moved to bit 4 and isolated
+template <int sh>
+static inline __attribute__((always_inline)) __m512i q5k_bit4(__m512i qh, __m512i m10) {
+    if constexpr (sh > 0) {
+        return _mm512_and_si512(_mm512_slli_epi16(qh, sh), m10);
+    } else if constexpr (sh < 0) {
+        return _mm512_and_si512(_mm512_srli_epi16(qh, -sh), m10);
+    } else {
+        return _mm512_and_si512(qh, m10);
+    }
+}
+
+// sub-blocks 2p (low nibbles, qh bit 2p) and 2p + 1 (high nibbles, qh bit 2p + 1)
+template <int p>
+static inline __attribute__((always_inline)) void q5k_gemm_p(const block_q5_Kx8 & b, const block_q8_Kx4 & a, const __m512i * qh,
+                                                             const uint8_t * sc, __m512 * sb, __m512i m0f, __m512i m10) {
+    __m512i al[4], ah[4];
+    for (int m = 0; m < 4; m++) {
+        al[m] = _mm512_setzero_si512();
+        ah[m] = _mm512_setzero_si512();
+    }
+#pragma GCC unroll 4
+    for (int kk = 0; kk < 4; kk++) {
+        const __m512i qs = _mm512_loadu_si512((const __m512i *) (b.qs + (p * 4 + kk) * 64));
+        const __m512i wl = _mm512_ternarylogic_epi32(q5k_bit4<4 - 2 * p>(qh[kk], m10), m0f, qs, 0xB8);
+        const __m512i wh = _mm512_ternarylogic_epi32(q5k_bit4<3 - 2 * p>(qh[kk], m10), m0f, _mm512_srli_epi16(qs, 4), 0xB8);
+        const int8_t * aq = a.qs + p * 256 + kk * 32;
+#pragma GCC unroll 4
+        for (int m = 0; m < 4; m++) {
+            int64_t xl, xh;
+            memcpy(&xl, aq + m * 8, 8);
+            memcpy(&xh, aq + 128 + m * 8, 8);
+            al[m] = _mm512_dpbusd_epi32(al[m], wl, _mm512_set1_epi64(xl));
+            ah[m] = _mm512_dpbusd_epi32(ah[m], wh, _mm512_set1_epi64(xh));
+        }
+    }
+    const __m128i s0 = _mm_loadl_epi64((const __m128i *) (sc + (2 * p) * 16));
+    const __m128i s1 = _mm_loadl_epi64((const __m128i *) (sc + (2 * p + 1) * 16));
+    const __m512  f0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(s0, s0)));
+    const __m512  f1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(s1, s1)));
+    for (int m = 0; m < 4; m++) {
+        sb[m] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(al[m]), f0, sb[m]);
+        sb[m] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ah[m]), f1, sb[m]);
+    }
+}
+
+static void ggml_gemm_q5_K_8x8_q8_K_vnni(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+    const int nb = n / QK_K;
+    const __m512i m0f  = _mm512_set1_epi8(0x0F);
+    const __m512i m10  = _mm512_set1_epi8(0x10);
+    const __m512i one  = _mm512_set1_epi16(1);
+    const __m512i dup2 = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);
+    // utmp: per sub-block, 8 row scales then 8 row mins; bsf[8q + 2m + h]: row m's bsum of sub-block 2q + h
+    alignas(64) uint32_t utmp[32];
+    alignas(64) float    bsf[32];
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_Kx4 * a_ptr = (const block_q8_Kx4 *) vy + y * nb;
+        for (int x = 0; x < nc / 8; x++) {
+            const block_q5_Kx8 * b_ptr = (const block_q5_Kx8 *) vx + x * nb;
+            __m512 tot[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
+            for (int l = 0; l < nb; l++) {
+                const block_q5_Kx8 & b = b_ptr[l];
+                const block_q8_Kx4 & a = a_ptr[l];
+                q5k_prefetch(&b);
+                for (int sbi = 0; sbi < 8; sbi++) {
+                    uint32_t u[3];
+                    memcpy(u, b.scales + sbi * 12, 12);
+                    utmp[sbi * 4 + 0] = u[0] & kmask1;
+                    utmp[sbi * 4 + 1] = (u[2] & kmask2) | (((u[0] >> 6) & kmask3) << 4);
+                    utmp[sbi * 4 + 2] = u[1] & kmask1;
+                    utmp[sbi * 4 + 3] = ((u[2] >> 4) & kmask2) | (((u[1] >> 6) & kmask3) << 4);
+                }
+                for (int i = 0; i < 2; i++) {
+                    const __m512i bs16 = _mm512_loadu_si512((const __m512i *) (a.bsums + i * 32));
+                    _mm512_store_ps(bsf + i * 16, _mm512_cvtepi32_ps(_mm512_madd_epi16(bs16, one)));
+                }
+                const uint8_t * sc = (const uint8_t *) utmp;
+                __asm__ volatile("" : "+r"(sc) :: "memory");
+                __m512i qh[4];
+                for (int kk = 0; kk < 4; kk++) {
+                    qh[kk] = _mm512_loadu_si512((const __m512i *) (b.qh + kk * 64));
+                }
+                __m512 sb[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
+                q5k_gemm_p<0>(b, a, qh, sc, sb, m0f, m10);
+                q5k_gemm_p<1>(b, a, qh, sc, sb, m0f, m10);
+                q5k_gemm_p<2>(b, a, qh, sc, sb, m0f, m10);
+                q5k_gemm_p<3>(b, a, qh, sc, sb, m0f, m10);
+                __m512 mf[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
+                for (int q = 0; q < 4; q++) {
+                    const __m128i mn0 = _mm_loadl_epi64((const __m128i *) (sc + (2 * q) * 16 + 8));
+                    const __m128i mn1 = _mm_loadl_epi64((const __m128i *) (sc + (2 * q + 1) * 16 + 8));
+                    const __m512  mv  = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(mn0, mn1)));
+                    for (int m = 0; m < 4; m++) {
+                        double pr;
+                        memcpy(&pr, bsf + 8 * q + 2 * m, 8);
+                        mf[m] = _mm512_fmadd_ps(mv, _mm512_castpd_ps(_mm512_set1_pd(pr)), mf[m]);
+                    }
+                }
+                const __m512 dr  = _mm512_permutexvar_ps(dup2, _mm512_cvtph_ps(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) b.d))));
+                const __m512 dmr = _mm512_permutexvar_ps(dup2, _mm512_cvtph_ps(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) b.dmin))));
+                for (int m = 0; m < 4; m++) {
+                    const __m512 ad = _mm512_set1_ps(a.d[m]);
+                    tot[m] = _mm512_fmadd_ps(sb[m], _mm512_mul_ps(dr, ad), tot[m]);
+                    tot[m] = _mm512_fnmadd_ps(mf[m], _mm512_mul_ps(dmr, ad), tot[m]);
+                }
+            }
+            for (int m = 0; m < 4; m++) {
+                const __m512 t = _mm512_add_ps(tot[m], _mm512_permute_ps(tot[m], 0xB1));
+                _mm256_storeu_ps(s + (y * 4 + m) * bs + x * 8, _mm512_castps512_ps256(_mm512_maskz_compress_ps(0x5555, t)));
+            }
+        }
+    }
+}
+#endif
+
 void ggml_gemm_q5_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    if (ggml_q5k_vnni_enabled()) {
+        ggml_gemm_q5_K_8x8_q8_K_vnni(n, s, bs, vx, vy, nr, nc);
+        return;
+    }
+#endif
     const int qk = QK_K;
     const int nb = n / qk;
     const int ncols_interleaved = 8;
