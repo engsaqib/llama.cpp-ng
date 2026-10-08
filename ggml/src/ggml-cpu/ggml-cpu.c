@@ -3734,6 +3734,21 @@ void ggml_threadpool_pause(struct ggml_threadpool * threadpool) {
 #endif
 }
 
+uint32_t ggml_threadpool_get_poll(struct ggml_threadpool * threadpool) {
+    return threadpool->poll;
+}
+
+// workers read the level at the start of every wait, so a change takes effect from the next graph
+void ggml_threadpool_set_poll(struct ggml_threadpool * threadpool, uint32_t poll) {
+#ifndef GGML_USE_OPENMP
+    ggml_mutex_lock(&threadpool->mutex);
+    threadpool->poll = poll;
+    ggml_mutex_unlock(&threadpool->mutex);
+#else
+    threadpool->poll = poll;
+#endif
+}
+
 void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #ifndef GGML_USE_OPENMP
     ggml_mutex_lock(&threadpool->mutex);

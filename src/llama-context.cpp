@@ -2529,6 +2529,25 @@ ggml_status llama_context::graph_compute(
         if (set_threadpool_fn) {
             set_threadpool_fn(backend_cpu, tp);
         }
+
+        // the NUMA node pools (directly, or behind a Meta backend) are not the attached pool, so
+        // they would otherwise keep the default poll level whatever --poll / --spec-draft-poll say
+        auto * get_poll_fn = (decltype(ggml_threadpool_get_poll) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_get_poll");
+        if (tp != nullptr && get_poll_fn != nullptr) {
+            typedef void (*set_poll_t)(ggml_backend_t, int);
+            const int poll = (int) get_poll_fn(tp);
+            for (auto & backend : backends) {
+                if (backend.get() == backend_cpu) {
+                    continue;
+                }
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                ggml_backend_reg_t breg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto set_poll_fn = breg ? (set_poll_t) ggml_backend_reg_get_proc_address(breg, "ggml_backend_set_poll") : nullptr;
+                if (set_poll_fn != nullptr) {
+                    set_poll_fn(backend.get(), poll);
+                }
+            }
+        }
     }
 
     // set the number of threads for all the backends

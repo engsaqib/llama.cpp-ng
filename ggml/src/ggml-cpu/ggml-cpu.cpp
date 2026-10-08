@@ -245,6 +245,7 @@ struct ggml_backend_cpu_context {
     // owned by a NUMA node backend, it is pinned to the CPUs of that node
     ggml_threadpool_t   own_threadpool;
     int                 own_threadpool_size;
+    int                 own_threadpool_poll; // < 0: the ggml_threadpool_params_init default
 
     // owned by a NUMA node backend, NULL means graph_compute runs synchronously on the calling thread
     struct ggml_backend_cpu_async * async;
@@ -581,6 +582,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->threadpool          = NULL;
     ctx->own_threadpool      = NULL;
     ctx->own_threadpool_size = 0;
+    ctx->own_threadpool_poll = -1;
     ctx->async               = NULL;
     ctx->work_data           = NULL;
     ctx->work_size           = 0;
@@ -634,6 +636,9 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
         ggml_threadpool_t tp = ggml_backend_cpu_device_threadpool(backend_cpu->device, n_threads);
         if (tp != NULL) {
             ggml_threadpool_free(ctx->own_threadpool);
+            if (ctx->own_threadpool_poll >= 0) {
+                ggml_threadpool_set_poll(tp, (uint32_t) ctx->own_threadpool_poll);
+            }
             ctx->own_threadpool      = tp;
             ctx->own_threadpool_size = n_threads;
         } else {
@@ -643,6 +648,25 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
     }
 
     ctx->n_threads = n_threads;
+}
+
+// the node pool is created with the ggml_threadpool_params_init poll level (50), whatever the
+// context asked for. two contexts whose node pools are pinned to the same CPUs (target and MTP
+// draft) then spin against each other through every graph of the other; this lets the context
+// apply its own level to the node pools as it does to its attached pool
+static void ggml_backend_cpu_set_poll(ggml_backend_t backend_cpu, int poll) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+
+    if (ctx->own_threadpool == NULL || poll < 0 || poll == ctx->own_threadpool_poll) {
+        return;
+    }
+
+    ggml_backend_cpu_async_wait_idle(ctx);
+
+    ggml_threadpool_set_poll(ctx->own_threadpool, (uint32_t) poll);
+    ctx->own_threadpool_poll = poll;
 }
 
 void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool_t threadpool) {
@@ -1865,6 +1889,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
         return (void *)ggml_backend_cpu_set_threadpool;
+    }
+    if (strcmp(name, "ggml_threadpool_get_poll") == 0) {
+        return (void *)ggml_threadpool_get_poll;
+    }
+    if (strcmp(name, "ggml_backend_set_poll") == 0) {
+        return (void *)ggml_backend_cpu_set_poll;
     }
 
     return NULL;

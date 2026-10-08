@@ -3157,6 +3157,20 @@ static void ggml_backend_meta_set_n_threads(ggml_backend_t backend, int n_thread
     ggml_backend_set_n_threads_total(simple_backends.data(), simple_backends.size(), n_threads);
 }
 
+static void ggml_backend_meta_set_poll(ggml_backend_t backend, int poll) {
+    typedef void (*set_poll_t)(ggml_backend_t, int);
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    for (size_t i = 0; i < n_backends; i++) {
+        ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, i);
+        ggml_backend_dev_t dev = ggml_backend_get_device(simple);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        set_poll_t set_fn = reg ? (set_poll_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_poll") : nullptr;
+        if (set_fn != nullptr) {
+            set_fn(simple, poll);
+        }
+    }
+}
+
 static const char * ggml_backend_meta_reg_get_name(ggml_backend_reg_t reg) {
     return "Meta";
 
@@ -3180,6 +3194,9 @@ static ggml_backend_dev_t ggml_backend_meta_reg_get_device(ggml_backend_reg_t re
 static void * ggml_backend_meta_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         return (void *) ggml_backend_meta_set_n_threads;
+    }
+    if (strcmp(name, "ggml_backend_set_poll") == 0) {
+        return (void *) ggml_backend_meta_set_poll;
     }
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_meta_dev_get_extra_bufts;
